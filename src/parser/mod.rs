@@ -203,6 +203,10 @@ pub fn parse_block(source: &str) -> (FountainElement, String) {
     if let Some(rest) = s.strip_prefix('@') {
         return (FountainElement::Character, rest.trim().to_uppercase());
     }
+    // ':WORD' — shot / transition marker (non-standard extension)
+    if s.starts_with(':') && s.len() > 1 && !s.starts_with("::") {
+        return (FountainElement::Transition, s[1..].trim().to_uppercase());
+    }
     if s.starts_with('.') && !s.starts_with("..") {
         return (
             FountainElement::SceneHeading,

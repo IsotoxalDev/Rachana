@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use gpui::*;
 
 mod export;
@@ -6,16 +8,25 @@ mod model;
 mod parser;
 mod ui;
 
-struct RachanaApp;
-
-impl Render for RachanaApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(rgb(0x1c1c1c))
-    }
-}
+use model::Document;
+use ui::document_view::DocumentView;
+use ui::modal::ModalState;
+use ui::text_runs::{
+    COURIER_PRIME_BOLD, COURIER_PRIME_BOLD_ITALIC, COURIER_PRIME_ITALIC, COURIER_PRIME_REGULAR,
+};
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
+        // Register Courier Prime with the text system before opening any window.
+        cx.text_system()
+            .add_fonts(vec![
+                Cow::Borrowed(COURIER_PRIME_REGULAR),
+                Cow::Borrowed(COURIER_PRIME_BOLD),
+                Cow::Borrowed(COURIER_PRIME_ITALIC),
+                Cow::Borrowed(COURIER_PRIME_BOLD_ITALIC),
+            ])
+            .ok(); // non-fatal: falls back to system font if bytes are invalid
+
         let size = size(px(1280.0), px(800.0));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size, cx)),
@@ -29,7 +40,23 @@ fn main() {
             app_id: Some("rachana".to_string()),
             ..Default::default()
         };
-        cx.open_window(options, |_window, cx| cx.new(|_cx| RachanaApp))
-            .unwrap();
+
+        cx.open_window(options, |_window, cx| {
+            let initial_doc = if std::env::var("TESTING").as_deref() == Ok("1") {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("example/Big-Fish.fountain");
+                crate::io::load_fountain(&path).unwrap_or_else(|e| {
+                    eprintln!("TESTING: failed to load Big-Fish.fountain: {e}");
+                    Document::new()
+                })
+            } else {
+                Document::new()
+            };
+
+            let document = cx.new(|_| initial_doc);
+            let modal = cx.new(|_| ModalState::new());
+            cx.new(|cx| DocumentView::new(document, modal, cx))
+        })
+        .unwrap();
     });
 }

@@ -41,6 +41,15 @@ const WHITE_OFF: Hsla = Hsla { h: 0.0, s: 0.0, l: 0.82, a: 1.0 }; // section h2
 const WHITE_MUTED: Hsla = Hsla { h: 0.0, s: 0.0, l: 0.70, a: 1.0 }; // section h3+
 const GRAY_NOTE: Hsla = Hsla { h: 0.0, s: 0.0, l: 0.53, a: 1.0 }; // notes (#888)
 
+// Standard Fountain margins on a 700px page (700 / 8.5in ≈ 82.35 px/in)
+const LEFT_ACTION: f32 = 124.0;  // 1.5"
+const RIGHT_ACTION: f32 = 82.0;  // 1.0"
+const LEFT_CHARACTER: f32 = 305.0; // 3.7"
+const LEFT_DIALOGUE: f32 = 206.0; // 2.5"
+const RIGHT_DIALOGUE: f32 = 165.0; // 2.0"
+const LEFT_PAREN: f32 = 247.0;   // 3.0"
+const RIGHT_PAREN: f32 = 206.0;  // 2.5"
+
 fn action_style() -> ElementStyle {
     ElementStyle {
         font_family: COURIER_PRIME.into(),
@@ -48,8 +57,8 @@ fn action_style() -> ElementStyle {
         font_style: FontStyle::Normal,
         font_size: px(12.0),
         line_height: px(22.0),
-        left_pad: px(0.0),
-        right_pad: px(0.0),
+        left_pad: px(LEFT_ACTION),
+        right_pad: px(RIGHT_ACTION),
         text_align: TextAlign::Left,
         color: WHITE_NORMAL,
         uppercase: false,
@@ -70,26 +79,28 @@ pub fn element_style(element: &FountainElement) -> ElementStyle {
         FountainElement::Action => action_style(),
 
         FountainElement::Character => ElementStyle {
-            // ~42% of a standard 600px content column
-            left_pad: px(252.0),
+            left_pad: px(LEFT_CHARACTER),
+            right_pad: px(RIGHT_ACTION),
             uppercase: true,
             ..action_style()
         },
 
         FountainElement::Dialogue => ElementStyle {
-            left_pad: px(150.0),
-            right_pad: px(150.0),
+            left_pad: px(LEFT_DIALOGUE),
+            right_pad: px(RIGHT_DIALOGUE),
             ..action_style()
         },
 
         FountainElement::Parenthetical => ElementStyle {
-            left_pad: px(150.0),
-            right_pad: px(150.0),
+            left_pad: px(LEFT_PAREN),
+            right_pad: px(RIGHT_PAREN),
             font_style: FontStyle::Italic,
             ..action_style()
         },
 
         FountainElement::Transition => ElementStyle {
+            left_pad: px(LEFT_ACTION),
+            right_pad: px(RIGHT_ACTION),
             text_align: TextAlign::Right,
             uppercase: true,
             ..action_style()

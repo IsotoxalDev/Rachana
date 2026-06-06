@@ -28,8 +28,11 @@ transition = {
 }
 
 // Character
-char_extension = { " (" ~ (!")" ~ ANY)+ ~ ")" }
-character      = { (ASCII_ALPHA_UPPER | " " | "'" | ".")+ ~ char_extension? ~ &NEWLINE }
+// char_extension allows optional leading space so "(CONT'D)" without a space also matches
+char_extension = { " "* ~ "(" ~ (!")" ~ ANY)+ ~ ")" }
+// char_name: first word then additional space-separated words (no trailing space before extension)
+char_name      = { (ASCII_ALPHA_UPPER | "'" | ".")+ ~ (" " ~ (ASCII_ALPHA_UPPER | "'" | ".") +)* }
+character      = { char_name ~ char_extension* ~ &NEWLINE }
 
 // Dialogue and parenthetical
 parenthetical  = { "(" ~ (!")" ~ ANY)* ~ ")" }
