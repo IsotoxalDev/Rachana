@@ -1,0 +1,66 @@
+// Whitespace and fundamentals
+NEWLINE      = _{ "\r\n" | "\n" }
+BLANK_LINE   = _{ NEWLINE+ }
+line_char    = _{ !NEWLINE ~ ANY }
+line_text    =  { line_char+ }
+rest_of_line =  { line_char* }
+
+// Title page (key: value pairs before first blank line)
+title_key   = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | " ")* }
+title_value = { rest_of_line }
+title_item  = { title_key ~ ":" ~ " "* ~ title_value ~ NEWLINE }
+title_page  = { title_item+ ~ BLANK_LINE }
+
+// Forced elements
+forced_scene     = { "." ~ !"." ~ rest_of_line }
+forced_action    = { "!" ~ rest_of_line }
+forced_character = { "@" ~ rest_of_line }
+
+// Scene heading (natural)
+scene_prefix  = _{ ^"INT/EXT" | ^"INT." | ^"EXT." | ^"I/E" }
+scene_heading =  { scene_prefix ~ rest_of_line }
+
+// Transition
+transition = {
+    (ASCII_ALPHA_UPPER | " ")+ ~ " TO:" ~ &NEWLINE
+  | "FADE OUT." ~ &NEWLINE
+  | "FADE TO BLACK." ~ &NEWLINE
+}
+
+// Character
+char_extension = { " (" ~ (!")" ~ ANY)+ ~ ")" }
+character      = { (ASCII_ALPHA_UPPER | " " | "'" | ".")+ ~ char_extension? ~ &NEWLINE }
+
+// Dialogue and parenthetical
+parenthetical  = { "(" ~ (!")" ~ ANY)* ~ ")" }
+dialogue_text  = { line_char+ }
+dialogue_line  = { parenthetical | dialogue_text }
+dialogue_block = { character ~ NEWLINE ~ (dialogue_line ~ NEWLINE)+ }
+
+// Section and note
+section = { "#"+ ~ " "* ~ rest_of_line }
+note    = { "[[" ~ (!"]" ~ ANY)* ~ "]]" }
+
+// Page break
+page_break = { "===" ~ rest_of_line }
+
+// Action (catch-all)
+action_line  = { line_text }
+action_block = { action_line ~ (NEWLINE ~ action_line)* }
+
+// Top-level element (order matters)
+element = {
+    forced_scene
+  | forced_action
+  | forced_character
+  | scene_heading
+  | transition
+  | section
+  | note
+  | page_break
+  | dialogue_block
+  | action_block
+}
+
+// Full document
+document = { SOI ~ title_page? ~ (element ~ BLANK_LINE*)* ~ EOI }
