@@ -29,6 +29,8 @@ pub struct BlockView {
     pub focused: bool,
     pub cursor_char: usize,
     pub selection: Option<Range<usize>>,
+    /// Window-space Y of this block's top edge, updated each frame via on_children_prepainted.
+    pub top_y: f32,
     focus_handle: FocusHandle,
 }
 
@@ -50,13 +52,14 @@ impl BlockView {
             focused: false,
             cursor_char: 0,
             selection: None,
+            top_y: 0.0,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    /// Return the character index (in the block's raw/uppercased text) that
-    /// corresponds to the given window-space X coordinate.
-    fn compute_cursor(&self, click_x: Pixels, window: &Window, cx: &mut Context<Self>) -> usize {
+    /// Return the character index corresponding to the given window-space click position,
+    /// accounting for word-wrapped visual lines.
+    fn compute_cursor(&self, click_x: Pixels, click_y: Pixels, window: &Window, cx: &mut Context<Self>) -> usize {
         let (text, element) = {
             let doc = self.document.read(cx);
             let Some(block) = doc.blocks.get(self.block_index) else { return 0 };
@@ -64,18 +67,17 @@ impl BlockView {
         };
 
         let style = element_style(&element);
-        // Replace newlines with spaces so shape_line doesn't panic; char count stays the same.
         let raw: String = {
             let s = if style.uppercase { text.to_uppercase() } else { text };
             s.replace('\n', " ")
         };
         if raw.is_empty() { return 0; }
 
-        // Work in raw f32 to avoid Pixels private field access.
         let viewport_w = window.viewport_size().width.as_f32();
-        let page_left   = (viewport_w - 700.0) / 2.0;
-        let content_left  = page_left + style.left_pad.as_f32();
+        let page_left = (viewport_w - 700.0) / 2.0;
+        let content_left = page_left + style.left_pad.as_f32();
         let content_width = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
+        let wrap_width = px(content_width);
 
         let run = make_run(&style, raw.len(), None, false, false);
         let shaped = window.text_system().shape_line(
@@ -86,27 +88,59 @@ impl BlockView {
         );
         let total_width = shaped.width().as_f32();
 
-        // Offset of the text's left edge within the content area (accounts for alignment).
         let text_indent: f32 = match style.text_align {
             StyleAlign::Left   => 0.0,
             StyleAlign::Right  => (content_width - total_width).max(0.0),
             StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
         };
 
-        let click_in_text = click_x.as_f32() - content_left - text_indent;
-        if click_in_text <= 0.0 { return 0; }
+        // Which visual (wrapped) line was clicked?
+        let local_y = (click_y.as_f32() - self.top_y).max(0.0);
+        let line_h = style.line_height.as_f32();
+        let visual_line = (local_y / line_h).floor() as usize;
 
+        let wrap_starts = find_wrap_starts(&raw, &shaped, wrap_width);
+        let num_lines = wrap_starts.len() + 1;
+        let visual_line = visual_line.min(num_lines.saturating_sub(1));
+
+        // Byte range for the clicked visual line.
+        let line_start_byte: usize = if visual_line == 0 {
+            0
+        } else {
+            wrap_starts[visual_line - 1]
+        };
+        let line_end_byte: usize = wrap_starts.get(visual_line).copied().unwrap_or(raw.len());
+
+        // Absolute X offset (in the shaped text) at the start of this visual line.
+        let line_start_abs_x: f32 = if line_start_byte == 0 {
+            0.0
+        } else {
+            shaped.split_at(line_start_byte).0.width().as_f32()
+        };
+
+        // For wrapped lines beyond the first, the indent resets to 0.
+        let effective_indent = if visual_line == 0 { text_indent } else { 0.0 };
+        let click_in_content = (click_x.as_f32() - content_left - effective_indent).max(0.0);
+        let target_abs_x = click_in_content + line_start_abs_x;
+
+        // Find the character whose midpoint is nearest to target_abs_x.
         let chars: Vec<char> = raw.chars().collect();
-        let mut byte_offset = 0usize;
-        let mut x_prev = 0.0f32;
-        for (i, ch) in chars.iter().enumerate() {
-            byte_offset += ch.len_utf8();
-            let x_next = shaped.split_at(byte_offset).0.width().as_f32();
-            // Snap to nearest character boundary.
-            if click_in_text <= (x_prev + x_next) / 2.0 {
-                return i;
+        let char_start = raw[..line_start_byte].chars().count();
+        let mut cur_byte = line_start_byte;
+        let mut x_prev = line_start_abs_x;
+
+        for ci in char_start..chars.len() {
+            cur_byte += chars[ci].len_utf8();
+            let x_next = shaped.split_at(cur_byte).0.width().as_f32();
+
+            if target_abs_x <= (x_prev + x_next) / 2.0 {
+                return ci;
             }
             x_prev = x_next;
+
+            if cur_byte >= line_end_byte {
+                return ci + 1;
+            }
         }
         chars.len()
     }
@@ -160,21 +194,21 @@ impl Render for BlockView {
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.clone().focus(window, cx);
-                let char_idx = this.compute_cursor(event.position.x, window, cx);
+                let char_idx = this.compute_cursor(event.position.x, event.position.y, window, cx);
                 this.cursor_char = char_idx;
                 this.selection = None;
                 cx.emit(CursorClicked { char_idx });
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.clone().focus(window, cx);
-                let char_idx = this.compute_cursor(event.position.x, window, cx);
+                let char_idx = this.compute_cursor(event.position.x, event.position.y, window, cx);
                 this.cursor_char = char_idx;
                 cx.emit(CursorClicked { char_idx });
                 cx.emit(RightClicked { position: event.position, char_idx });
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if event.pressed_button == Some(MouseButton::Left) {
-                    let cur = this.compute_cursor(event.position.x, window, cx);
+                    let cur = this.compute_cursor(event.position.x, event.position.y, window, cx);
                     this.cursor_char = cur;
                     cx.emit(CursorDragged { char_idx: cur });
                 }

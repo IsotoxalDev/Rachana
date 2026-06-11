@@ -967,15 +967,26 @@ impl Render for DocumentView {
                             .pt(px(40.0))
                             .pb(px(40.0))
                             .child(
-                                div()
-                                    .w(px(700.0))
-                                    .min_h(px(1056.0))
-                                    .bg(rgb(0x252525))
-                                    .pt(px(80.0))
-                                    .pb(px(80.0))
-                                    .flex()
-                                    .flex_col()
-                                    .children(block_views),
+                                {
+                                    let bvs_snap = block_views.clone();
+                                    div()
+                                        .w(px(700.0))
+                                        .min_h(px(1056.0))
+                                        .bg(rgb(0x252525))
+                                        .pt(px(80.0))
+                                        .pb(px(80.0))
+                                        .flex()
+                                        .flex_col()
+                                        .on_children_prepainted(move |bounds_list, _win, cx| {
+                                            for (i, bounds) in bounds_list.iter().enumerate() {
+                                                if let Some(bv) = bvs_snap.get(i) {
+                                                    let y = bounds.origin.y.as_f32();
+                                                    bv.update(cx, |v, _| v.top_y = y);
+                                                }
+                                            }
+                                        })
+                                        .children(block_views)
+                                },
                             ),
                     ),
             )
