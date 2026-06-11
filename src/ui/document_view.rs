@@ -2,7 +2,7 @@ use gpui::*;
 
 use crate::model::{Block, Document, FountainElement};
 use crate::parser::parse_block;
-use crate::ui::block_view::{BlockView, CursorClicked, RightClicked};
+use crate::ui::block_view::{BlockView, CursorClicked, CursorDragged, RightClicked};
 use crate::ui::modal::{InsertPoint, Key, ModalAction, ModalState};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,8 @@ pub struct DocumentView {
     scroll_handle: ScrollHandle,
     context_menu: Option<Point<Pixels>>,
     sidebar_open: bool,
+    /// Anchor point (block_index, char_index) where a mouse-drag selection started.
+    selection_anchor: Option<(usize, usize)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -78,11 +80,19 @@ impl DocumentView {
             first.update(cx, |v, _| v.focused = true);
         }
 
-        // Subscribe to click and right-click events from each block view.
+        // Subscribe to click, drag, and right-click events from each block view.
         let mut subs: Vec<Subscription> = Vec::new();
         for bv in &block_views {
             subs.push(cx.subscribe(bv, |this, bv, event: &CursorClicked, cx| {
                 this.context_menu = None;
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.selection_anchor = Some((this.focused_block, this.cursor_char));
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            subs.push(cx.subscribe(bv, |this, bv, event: &CursorDragged, cx| {
+                if this.selection_anchor.is_none() { return; }
                 this.focused_block = bv.read(cx).block_index;
                 this.cursor_char = event.char_idx;
                 this.push_cursor(cx);
@@ -92,6 +102,7 @@ impl DocumentView {
                 this.context_menu = None;
                 this.focused_block = bv.read(cx).block_index;
                 this.cursor_char = event.char_idx;
+                this.selection_anchor = None;
                 this.push_cursor(cx);
                 this.context_menu = Some(event.position);
                 cx.notify();
@@ -110,6 +121,7 @@ impl DocumentView {
             scroll_handle: ScrollHandle::new(),
             context_menu: None,
             sidebar_open: false,
+            selection_anchor: None,
             _subscriptions: subs,
         }
     }
@@ -129,6 +141,14 @@ impl DocumentView {
                 this.context_menu = None;
                 this.focused_block = bv.read(cx).block_index;
                 this.cursor_char = event.char_idx;
+                this.selection_anchor = Some((this.focused_block, this.cursor_char));
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            self._subscriptions.push(cx.subscribe(&bv, |this, bv, event: &CursorDragged, cx| {
+                if this.selection_anchor.is_none() { return; }
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
                 this.push_cursor(cx);
                 cx.notify();
             }));
@@ -136,6 +156,7 @@ impl DocumentView {
                 this.context_menu = None;
                 this.focused_block = bv.read(cx).block_index;
                 this.cursor_char = event.char_idx;
+                this.selection_anchor = None;
                 this.push_cursor(cx);
                 this.context_menu = Some(event.position);
                 cx.notify();
@@ -152,7 +173,43 @@ impl DocumentView {
         for (i, bv) in self.block_views.iter().enumerate() {
             let focused = i == self.focused_block;
             let cur = if focused { self.cursor_char } else { 0 };
-            bv.update(cx, |v, _| { v.focused = focused; v.cursor_char = cur; });
+            let sel = self.compute_block_selection(i, cx);
+            bv.update(cx, |v, _| { v.focused = focused; v.cursor_char = cur; v.selection = sel; });
+        }
+    }
+
+    /// Compute the selection range to display for block `i` given the current anchor→cursor span.
+    fn compute_block_selection(&self, i: usize, cx: &Context<Self>) -> Option<std::ops::Range<usize>> {
+        let (ab, ac) = self.selection_anchor?;
+        let (cb, cc) = (self.focused_block, self.cursor_char);
+
+        // Normalise to (start_block, start_char) → (end_block, end_char) in document order.
+        let (sb, sc, eb, ec) = if ab < cb || (ab == cb && ac <= cc) {
+            (ab, ac, cb, cc)
+        } else {
+            (cb, cc, ab, ac)
+        };
+
+        if i < sb || i > eb { return None; }
+
+        let block_len = self.document.read(cx).blocks.get(i)
+            .map(|b| b.text.chars().count()).unwrap_or(0);
+
+        if sb == eb {
+            if sc < ec { Some(sc..ec) } else { None }
+        } else if i == sb {
+            if sc < block_len { Some(sc..block_len) } else { None }
+        } else if i < eb {
+            if block_len > 0 { Some(0..block_len) } else { None }
+        } else {
+            if ec > 0 { Some(0..ec) } else { None }
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        match self.selection_anchor {
+            None => false,
+            Some((ab, ac)) => ab != self.focused_block || ac != self.cursor_char,
         }
     }
 
@@ -251,43 +308,89 @@ impl DocumentView {
         }
     }
 
-    fn get_selection(&self, cx: &Context<Self>) -> Option<std::ops::Range<usize>> {
-        self.block_views.get(self.focused_block)?.read(cx).selection.clone()
-    }
-
-    fn set_selection(&self, sel: Option<std::ops::Range<usize>>, cx: &mut Context<Self>) {
-        if let Some(bv) = self.block_views.get(self.focused_block) {
-            bv.update(cx, |v, _| v.selection = sel);
+    fn copy_selection(&self, _window: &mut Window, cx: &Context<Self>) {
+        if let Some(text) = self.get_selected_text(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
-    fn copy_selection(&self, _window: &mut Window, cx: &Context<Self>) {
-        let Some(range) = self.get_selection(cx) else { return; };
-        let text = self.text_of(self.focused_block, cx);
-        let chars: Vec<char> = text.chars().collect();
-        let start = range.start.min(chars.len());
-        let end = range.end.min(chars.len());
-        if start >= end { return; }
-        let selected: String = chars[start..end].iter().collect();
-        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+    fn get_selected_text(&self, cx: &Context<Self>) -> Option<String> {
+        let (ab, ac) = self.selection_anchor?;
+        let (cb, cc) = (self.focused_block, self.cursor_char);
+        let (sb, sc, eb, ec) = if ab < cb || (ab == cb && ac <= cc) {
+            (ab, ac, cb, cc)
+        } else {
+            (cb, cc, ab, ac)
+        };
+        if sb == eb {
+            if sc >= ec { return None; }
+            let text = self.text_of(sb, cx);
+            let s = char_to_byte(&text, sc);
+            let e = char_to_byte(&text, ec);
+            return Some(text[s..e].to_string());
+        }
+        let mut result = String::new();
+        for i in sb..=eb {
+            if i > sb { result.push('\n'); }
+            let text = self.text_of(i, cx);
+            if i == sb {
+                result.push_str(&text[char_to_byte(&text, sc)..]);
+            } else if i == eb {
+                result.push_str(&text[..char_to_byte(&text, ec)]);
+            } else {
+                result.push_str(&text);
+            }
+        }
+        Some(result)
     }
 
     fn delete_selection_text(&mut self, cx: &mut Context<Self>) {
-        let Some(sel) = self.get_selection(cx) else { return; };
-        let idx = self.focused_block;
-        let text = self.text_of(idx, cx);
-        let s = char_to_byte(&text, sel.start);
-        let e = char_to_byte(&text, sel.end);
-        if s >= e { return; }
-        self.mutate(cx, |blocks| {
-            if let Some(b) = blocks.get_mut(idx) {
-                b.text.drain(s..e);
-                b.raw.drain(s..e);
-            }
-        });
-        self.cursor_char = sel.start;
-        self.set_selection(None, cx);
-        self.re_parse_block(idx, cx);
+        let Some((ab, ac)) = self.selection_anchor else { return; };
+        let (cb, cc) = (self.focused_block, self.cursor_char);
+        let (sb, sc, eb, ec) = if ab < cb || (ab == cb && ac <= cc) {
+            (ab, ac, cb, cc)
+        } else {
+            (cb, cc, ab, ac)
+        };
+
+        self.selection_anchor = None;
+
+        if sb == eb {
+            if sc >= ec { return; }
+            let text = self.text_of(sb, cx);
+            let s = char_to_byte(&text, sc);
+            let e = char_to_byte(&text, ec);
+            self.mutate(cx, |blocks| {
+                if let Some(b) = blocks.get_mut(sb) {
+                    b.text.drain(s..e);
+                    b.raw.drain(s..e);
+                }
+            });
+            self.focused_block = sb;
+            self.cursor_char = sc;
+            self.re_parse_block(sb, cx);
+        } else {
+            // Collect tail of end block, attach to truncated start block.
+            let end_text = self.text_of(eb, cx);
+            let end_byte = char_to_byte(&end_text, ec);
+            let tail = end_text[end_byte..].to_string();
+
+            let start_text = self.text_of(sb, cx);
+            let start_byte = char_to_byte(&start_text, sc);
+            let merged = format!("{}{}", &start_text[..start_byte], tail);
+
+            self.mutate(cx, |blocks| {
+                if let Some(b) = blocks.get_mut(sb) {
+                    b.text = merged.clone();
+                    b.raw = merged.clone();
+                }
+                blocks.drain(sb + 1..=eb);
+            });
+            self.focused_block = sb;
+            self.cursor_char = sc;
+            self.re_parse_block(sb, cx);
+            self.sync_block_views(cx);
+        }
     }
 
     fn do_cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -300,7 +403,7 @@ impl DocumentView {
             Some(t) => t,
             None => return,
         };
-        if self.get_selection(cx).is_some() {
+        if self.has_selection() {
             self.delete_selection_text(cx);
         }
         for (i, line) in text.split('\n').enumerate() {
@@ -312,9 +415,11 @@ impl DocumentView {
     }
 
     fn do_select_all(&mut self, cx: &mut Context<Self>) {
-        let len = self.char_count(self.focused_block, cx);
-        self.set_selection(if len > 0 { Some(0..len) } else { None }, cx);
-        self.cursor_char = len;
+        let last = self.block_count(cx).saturating_sub(1);
+        let last_len = self.char_count(last, cx);
+        self.selection_anchor = Some((0, 0));
+        self.focused_block = last;
+        self.cursor_char = last_len;
     }
 
     fn do_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -418,6 +523,7 @@ impl DocumentView {
         if mods.control && !mods.alt {
             match ks.key.as_str() {
                 "z" => {
+                    self.selection_anchor = None;
                     if mods.shift { self.do_redo(cx); } else { self.do_undo(cx); }
                     self.push_cursor(cx);
                     cx.notify();
@@ -480,30 +586,48 @@ impl DocumentView {
     fn exec_insert(&mut self, action: ModalAction, cx: &mut Context<Self>) {
         match action {
             ModalAction::InsertChar(c) => {
-                if self.get_selection(cx).is_some() {
-                    self.delete_selection_text(cx);
-                }
+                if self.has_selection() { self.delete_selection_text(cx); }
                 self.insert_char(c, cx);
             }
             ModalAction::Backspace => {
-                if self.get_selection(cx).is_some() {
+                if self.has_selection() {
                     self.delete_selection_text(cx);
                 } else {
                     self.handle_backspace(cx);
                 }
             }
-            ModalAction::DeleteForward => self.delete_forward(cx),
+            ModalAction::DeleteForward => {
+                if self.has_selection() {
+                    self.delete_selection_text(cx);
+                } else {
+                    self.delete_forward(cx);
+                }
+            }
             ModalAction::SelectAll => self.do_select_all(cx),
-            ModalAction::SplitBlock => self.split_block(cx),
-            ModalAction::CycleElementType => self.cycle_element(cx),
-            ModalAction::Undo => self.do_undo(cx),
-            ModalAction::Redo => self.do_redo(cx),
+            ModalAction::SplitBlock => {
+                if self.has_selection() { self.delete_selection_text(cx); }
+                self.split_block(cx);
+            }
+            ModalAction::CycleElementType => {
+                self.selection_anchor = None;
+                self.cycle_element(cx);
+            }
+            ModalAction::Undo => {
+                self.selection_anchor = None;
+                self.do_undo(cx);
+            }
+            ModalAction::Redo => {
+                self.selection_anchor = None;
+                self.do_redo(cx);
+            }
             ModalAction::MoveCursor { motion, count } => {
-                self.set_selection(None, cx);
+                self.selection_anchor = None;
                 self.apply_motion_insert(motion, count, cx);
             }
-            ModalAction::EnterNormal | ModalAction::None => {}
-            _ => {}
+            ModalAction::EnterNormal | ModalAction::None => {
+                self.selection_anchor = None;
+            }
+            _ => { self.selection_anchor = None; }
         }
     }
 
@@ -554,6 +678,7 @@ impl DocumentView {
     // -----------------------------------------------------------------------
 
     fn exec_normal(&mut self, action: ModalAction, cx: &mut Context<Self>) {
+        self.selection_anchor = None;
         use crate::ui::modal::CursorMove::*;
         match action {
             ModalAction::MoveCursor { motion, count } => {

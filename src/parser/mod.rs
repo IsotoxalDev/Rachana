@@ -110,6 +110,31 @@ fn push_blocks(blocks: &mut Vec<Block>, pair: pest::iterators::Pair<Rule>, raw: 
                 .to_uppercase();
             blocks.push(Block::new(FountainElement::Character, text, raw));
         }
+        Rule::forced_dialogue_block => {
+            let mut sub = pair.into_inner();
+            if let Some(char_pair) = sub.next() {
+                let char_text = char_pair.as_str()
+                    .trim_start_matches('@')
+                    .trim()
+                    .to_uppercase();
+                let char_raw = char_pair.as_str().to_string();
+                blocks.push(Block::new(FountainElement::Character, char_text, char_raw));
+            }
+            for line_pair in sub {
+                if line_pair.as_rule() != Rule::dialogue_line { continue; }
+                if let Some(content) = line_pair.into_inner().next() {
+                    let cr = content.as_str()
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    let el = match content.as_rule() {
+                        Rule::parenthetical => FountainElement::Parenthetical,
+                        _ => FountainElement::Dialogue,
+                    };
+                    blocks.push(Block::new(el, cr.clone(), cr));
+                }
+            }
+        }
         Rule::transition => {
             let text = pair.as_str().trim().to_string();
             blocks.push(Block::new(FountainElement::Transition, text, raw));

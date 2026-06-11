@@ -12,19 +12,23 @@ title_item  = { title_key ~ ":" ~ " "* ~ title_value ~ NEWLINE }
 title_page  = { title_item+ ~ BLANK_LINE }
 
 // Forced elements
-forced_scene     = { "." ~ !"." ~ rest_of_line }
-forced_action    = { "!" ~ rest_of_line }
-forced_character = { "@" ~ rest_of_line }
+forced_scene          = { "." ~ !"." ~ rest_of_line }
+forced_action         = { "!" ~ rest_of_line }
+forced_character      = { "@" ~ rest_of_line }
+// @CHARACTER followed immediately by dialogue lines (must be tried before forced_character)
+forced_dialogue_block = { forced_character ~ NEWLINE ~ (dialogue_line ~ NEWLINE)+ }
 
 // Scene heading (natural)
 scene_prefix  = _{ ^"INT/EXT" | ^"INT." | ^"EXT." | ^"I/E" }
 scene_heading =  { scene_prefix ~ rest_of_line }
 
-// Transition
-transition = {
-    (ASCII_ALPHA_UPPER | " ")+ ~ " TO:" ~ &NEWLINE
+// Transition — use negative lookahead so greedy matching doesn't consume " TO:"
+trans_prefix = _{ (!(" TO:" ~ &NEWLINE) ~ (ASCII_ALPHA_UPPER | " "))* }
+transition   = {
+    trans_prefix ~ " TO:" ~ &NEWLINE
   | "FADE OUT." ~ &NEWLINE
   | "FADE TO BLACK." ~ &NEWLINE
+  | "CUT TO BLACK." ~ &NEWLINE
 }
 
 // Character
@@ -55,6 +59,7 @@ action_block = { action_line ~ (NEWLINE ~ action_line)* }
 element = {
     forced_scene
   | forced_action
+  | forced_dialogue_block
   | forced_character
   | scene_heading
   | transition

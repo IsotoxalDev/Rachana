@@ -17,6 +17,11 @@ pub struct RightClicked {
     pub char_idx: usize,
 }
 
+/// Emitted on every mouse-move while the left button is held down.
+pub struct CursorDragged {
+    pub char_idx: usize,
+}
+
 pub struct BlockView {
     pub block_index: usize,
     pub document: Entity<Document>,
@@ -24,13 +29,12 @@ pub struct BlockView {
     pub focused: bool,
     pub cursor_char: usize,
     pub selection: Option<Range<usize>>,
-    /// Character index of the drag start, used to extend selection on mouse-move.
-    drag_anchor: Option<usize>,
     focus_handle: FocusHandle,
 }
 
 impl EventEmitter<CursorClicked> for BlockView {}
 impl EventEmitter<RightClicked> for BlockView {}
+impl EventEmitter<CursorDragged> for BlockView {}
 
 impl BlockView {
     pub fn new(
@@ -46,7 +50,6 @@ impl BlockView {
             focused: false,
             cursor_char: 0,
             selection: None,
-            drag_anchor: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -158,7 +161,6 @@ impl Render for BlockView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.clone().focus(window, cx);
                 let char_idx = this.compute_cursor(event.position.x, window, cx);
-                this.drag_anchor = Some(char_idx);
                 this.cursor_char = char_idx;
                 this.selection = None;
                 cx.emit(CursorClicked { char_idx });
@@ -167,24 +169,14 @@ impl Render for BlockView {
                 this.focus_handle.clone().focus(window, cx);
                 let char_idx = this.compute_cursor(event.position.x, window, cx);
                 this.cursor_char = char_idx;
-                this.drag_anchor = None;
                 cx.emit(CursorClicked { char_idx });
                 cx.emit(RightClicked { position: event.position, char_idx });
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
-                this.drag_anchor = None;
-            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if event.pressed_button == Some(MouseButton::Left) {
-                    if let Some(anchor) = this.drag_anchor {
-                        let cur = this.compute_cursor(event.position.x, window, cx);
-                        let (start, end) = (anchor.min(cur), anchor.max(cur));
-                        this.selection = if start < end { Some(start..end) } else { None };
-                        this.cursor_char = cur;
-                        cx.notify();
-                    }
-                } else {
-                    this.drag_anchor = None;
+                    let cur = this.compute_cursor(event.position.x, window, cx);
+                    this.cursor_char = cur;
+                    cx.emit(CursorDragged { char_idx: cur });
                 }
             }));
 
