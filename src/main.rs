@@ -49,6 +49,12 @@ fn main() {
                     eprintln!("TESTING: failed to load Big-Fish.fountain: {e}");
                     Document::new()
                 })
+            } else if let Some(path_arg) = std::env::args().nth(1) {
+                let path = std::path::PathBuf::from(path_arg);
+                crate::io::load_fountain(&path).unwrap_or_else(|e| {
+                    eprintln!("error opening file: {e}");
+                    Document::new()
+                })
             } else {
                 Document::new()
             };

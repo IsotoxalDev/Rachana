@@ -10,9 +10,16 @@ pub enum Key {
     Escape,
     Enter,
     Backspace,
+    Delete,
+    Home,
+    End,
     Tab,
     /// Ctrl+R (redo)
     CtrlR,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +82,10 @@ pub enum ModalAction {
     ExtendSelectionRight,
     YankSelection,
     DeleteSelection,
+    /// Delete the character at the cursor (forward delete).
+    DeleteForward,
+    /// Select all text in the current block.
+    SelectAll,
     Undo,
     Redo,
     /// Placeholder — search is not yet implemented.
@@ -172,6 +183,15 @@ impl ModalState {
     }
 
     fn process_normal_key(&mut self, key: Key) -> ModalAction {
+        // Arrow keys work in normal mode too (alongside hjkl).
+        match &key {
+            Key::ArrowLeft => return ModalAction::MoveCursor { motion: CursorMove::Left, count: self.pending_count.take().unwrap_or(1) },
+            Key::ArrowRight => return ModalAction::MoveCursor { motion: CursorMove::Right, count: self.pending_count.take().unwrap_or(1) },
+            Key::ArrowUp => return ModalAction::MoveCursor { motion: CursorMove::Up, count: self.pending_count.take().unwrap_or(1) },
+            Key::ArrowDown => return ModalAction::MoveCursor { motion: CursorMove::Down, count: self.pending_count.take().unwrap_or(1) },
+            _ => {}
+        }
+
         let c = match key {
             Key::CtrlR => return ModalAction::Redo,
             Key::Escape => return ModalAction::None,
@@ -275,6 +295,13 @@ impl ModalState {
             Key::Enter => ModalAction::SplitBlock,
             Key::Tab => ModalAction::CycleElementType,
             Key::Backspace => ModalAction::Backspace,
+            Key::Delete => ModalAction::DeleteForward,
+            Key::Home => ModalAction::MoveCursor { motion: CursorMove::LineStart, count: 1 },
+            Key::End  => ModalAction::MoveCursor { motion: CursorMove::LineEnd,   count: 1 },
+            Key::ArrowLeft  => ModalAction::MoveCursor { motion: CursorMove::Left,  count: 1 },
+            Key::ArrowRight => ModalAction::MoveCursor { motion: CursorMove::Right, count: 1 },
+            Key::ArrowUp    => ModalAction::MoveCursor { motion: CursorMove::Up,    count: 1 },
+            Key::ArrowDown  => ModalAction::MoveCursor { motion: CursorMove::Down,  count: 1 },
             Key::Char(c) if !c.is_control() => ModalAction::InsertChar(c),
             _ => ModalAction::None,
         }
@@ -282,8 +309,8 @@ impl ModalState {
 
     fn process_visual_key(&mut self, key: Key) -> ModalAction {
         match key {
-            Key::Char('h') => ModalAction::ExtendSelectionLeft,
-            Key::Char('l') => ModalAction::ExtendSelectionRight,
+            Key::Char('h') | Key::ArrowLeft  => ModalAction::ExtendSelectionLeft,
+            Key::Char('l') | Key::ArrowRight => ModalAction::ExtendSelectionRight,
             Key::Char('y') => {
                 self.enter_normal();
                 ModalAction::YankSelection

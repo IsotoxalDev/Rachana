@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::block::Block;
 use super::element::FountainElement;
 
@@ -6,6 +8,7 @@ pub struct Document {
     pub title: String,
     pub author: String,
     pub dirty: bool,
+    pub path: Option<PathBuf>,
 }
 
 impl Document {
@@ -15,6 +18,7 @@ impl Document {
             title: String::new(),
             author: String::new(),
             dirty: false,
+            path: None,
         }
     }
 

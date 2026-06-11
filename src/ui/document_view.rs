@@ -2,7 +2,7 @@ use gpui::*;
 
 use crate::model::{Block, Document, FountainElement};
 use crate::parser::parse_block;
-use crate::ui::block_view::BlockView;
+use crate::ui::block_view::{BlockView, CursorClicked, RightClicked};
 use crate::ui::modal::{InsertPoint, Key, ModalAction, ModalState};
 
 // ---------------------------------------------------------------------------
@@ -54,6 +54,9 @@ pub struct DocumentView {
     block_views: Vec<Entity<BlockView>>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
+    context_menu: Option<Point<Pixels>>,
+    sidebar_open: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DocumentView {
@@ -75,6 +78,26 @@ impl DocumentView {
             first.update(cx, |v, _| v.focused = true);
         }
 
+        // Subscribe to click and right-click events from each block view.
+        let mut subs: Vec<Subscription> = Vec::new();
+        for bv in &block_views {
+            subs.push(cx.subscribe(bv, |this, bv, event: &CursorClicked, cx| {
+                this.context_menu = None;
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            subs.push(cx.subscribe(bv, |this, bv, event: &RightClicked, cx| {
+                this.context_menu = None;
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                this.context_menu = Some(event.position);
+                cx.notify();
+            }));
+        }
+
         Self {
             document,
             modal,
@@ -85,6 +108,9 @@ impl DocumentView {
             block_views,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
+            context_menu: None,
+            sidebar_open: false,
+            _subscriptions: subs,
         }
     }
 
@@ -98,7 +124,23 @@ impl DocumentView {
             let idx = self.block_views.len();
             let doc = self.document.clone();
             let modal = self.modal.clone();
-            self.block_views.push(cx.new(move |cx| BlockView::new(idx, doc, modal, cx)));
+            let bv = cx.new(move |cx| BlockView::new(idx, doc, modal, cx));
+            self._subscriptions.push(cx.subscribe(&bv, |this, bv, event: &CursorClicked, cx| {
+                this.context_menu = None;
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            self._subscriptions.push(cx.subscribe(&bv, |this, bv, event: &RightClicked, cx| {
+                this.context_menu = None;
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                this.context_menu = Some(event.position);
+                cx.notify();
+            }));
+            self.block_views.push(bv);
         }
         self.block_views.truncate(n);
         for (i, bv) in self.block_views.iter().enumerate() {
@@ -209,11 +251,159 @@ impl DocumentView {
         }
     }
 
+    fn get_selection(&self, cx: &Context<Self>) -> Option<std::ops::Range<usize>> {
+        self.block_views.get(self.focused_block)?.read(cx).selection.clone()
+    }
+
+    fn set_selection(&self, sel: Option<std::ops::Range<usize>>, cx: &mut Context<Self>) {
+        if let Some(bv) = self.block_views.get(self.focused_block) {
+            bv.update(cx, |v, _| v.selection = sel);
+        }
+    }
+
+    fn copy_selection(&self, _window: &mut Window, cx: &Context<Self>) {
+        let Some(range) = self.get_selection(cx) else { return; };
+        let text = self.text_of(self.focused_block, cx);
+        let chars: Vec<char> = text.chars().collect();
+        let start = range.start.min(chars.len());
+        let end = range.end.min(chars.len());
+        if start >= end { return; }
+        let selected: String = chars[start..end].iter().collect();
+        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+    }
+
+    fn delete_selection_text(&mut self, cx: &mut Context<Self>) {
+        let Some(sel) = self.get_selection(cx) else { return; };
+        let idx = self.focused_block;
+        let text = self.text_of(idx, cx);
+        let s = char_to_byte(&text, sel.start);
+        let e = char_to_byte(&text, sel.end);
+        if s >= e { return; }
+        self.mutate(cx, |blocks| {
+            if let Some(b) = blocks.get_mut(idx) {
+                b.text.drain(s..e);
+                b.raw.drain(s..e);
+            }
+        });
+        self.cursor_char = sel.start;
+        self.set_selection(None, cx);
+        self.re_parse_block(idx, cx);
+    }
+
+    fn do_cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(window, cx);
+        self.delete_selection_text(cx);
+    }
+
+    fn do_paste(&mut self, cx: &mut Context<Self>) {
+        let text = match cx.read_from_clipboard().and_then(|i| i.text()) {
+            Some(t) => t,
+            None => return,
+        };
+        if self.get_selection(cx).is_some() {
+            self.delete_selection_text(cx);
+        }
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 { self.split_block(cx); }
+            for ch in line.chars() {
+                if !ch.is_control() { self.insert_char(ch, cx); }
+            }
+        }
+    }
+
+    fn do_select_all(&mut self, cx: &mut Context<Self>) {
+        let len = self.char_count(self.focused_block, cx);
+        self.set_selection(if len > 0 { Some(0..len) } else { None }, cx);
+        self.cursor_char = len;
+    }
+
+    fn do_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Fountain Script".into()),
+        });
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) => {
+                    eprintln!("portal file picker failed: {e}");
+                    pick_file_subprocess().await
+                }
+                Err(_) => pick_file_subprocess().await,
+            };
+            let Some(path) = path else { return; };
+            match crate::io::load_fountain(&path) {
+                Ok(doc) => {
+                    weak_this.update(cx, |this, cx| {
+                        this.document.update(cx, |d, _| *d = doc);
+                        this.focused_block = 0;
+                        this.cursor_char = 0;
+                        this.history = EditHistory::new();
+                        this.sidebar_open = false;
+                        this.sync_block_views(cx);
+                        this.push_cursor(cx);
+                        cx.notify();
+                    }).ok();
+                }
+                Err(e) => eprintln!("open error: {e}"),
+            }
+        }).detach();
+    }
+
+    fn do_save(&mut self, cx: &mut Context<Self>) {
+        let path = self.document.read(cx).path.clone();
+        if let Some(p) = path {
+            let result = {
+                let doc = self.document.read(cx);
+                crate::io::save_fountain(&doc, &p)
+            };
+            match result {
+                Ok(()) => { self.document.update(cx, |d, _| d.dirty = false); }
+                Err(e) => eprintln!("save error: {e}"),
+            }
+        }
+    }
+
+    fn delete_forward(&mut self, cx: &mut Context<Self>) {
+        let idx = self.focused_block;
+        let count = self.char_count(idx, cx);
+        if self.cursor_char < count {
+            let text = self.text_of(idx, cx);
+            if let Some((start, ch)) = text.char_indices().nth(self.cursor_char) {
+                let end = start + ch.len_utf8();
+                self.mutate(cx, |blocks| {
+                    if let Some(b) = blocks.get_mut(idx) {
+                        b.text.drain(start..end);
+                        b.raw.drain(start..end);
+                    }
+                });
+                self.re_parse_block(idx, cx);
+            }
+        } else if idx + 1 < self.block_count(cx) {
+            let next = self.text_of(idx + 1, cx);
+            let fi = idx + 1;
+            self.mutate(cx, |blocks| {
+                if let Some(b) = blocks.get_mut(idx) {
+                    b.text.push_str(&next);
+                    b.raw.push_str(&next);
+                }
+                blocks.remove(fi);
+            });
+            self.re_parse_block(idx, cx);
+            self.sync_block_views(cx);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Key dispatch
     // -----------------------------------------------------------------------
 
-    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+
         let ks = &event.keystroke;
         let mods = &ks.modifiers;
 
@@ -224,12 +414,49 @@ impl DocumentView {
             return;
         }
 
-        // Ctrl+Z / Ctrl+Shift+Z — undo/redo (insert mode shortcut, bypasses modal).
-        if mods.control && !mods.alt && ks.key == "z" {
-            if mods.shift { self.do_redo(cx); } else { self.do_undo(cx); }
-            self.push_cursor(cx);
-            cx.notify();
-            return;
+        // Ctrl-only shortcuts (no shift, no alt).
+        if mods.control && !mods.alt {
+            match ks.key.as_str() {
+                "z" => {
+                    if mods.shift { self.do_redo(cx); } else { self.do_undo(cx); }
+                    self.push_cursor(cx);
+                    cx.notify();
+                    return;
+                }
+                "c" if !mods.shift => {
+                    self.copy_selection(window, cx);
+                    return;
+                }
+                "x" if !mods.shift => {
+                    self.do_cut(window, cx);
+                    self.push_cursor(cx);
+                    cx.notify();
+                    return;
+                }
+                "v" if !mods.shift => {
+                    self.do_paste(cx);
+                    self.push_cursor(cx);
+                    cx.notify();
+                    return;
+                }
+                "s" if !mods.shift => {
+                    self.do_save(cx);
+                    cx.notify();
+                    return;
+                }
+                "o" if !mods.shift => {
+                    self.do_open_file(window, cx);
+                    cx.notify();
+                    return;
+                }
+                "a" if !mods.shift => {
+                    self.do_select_all(cx);
+                    self.push_cursor(cx);
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         let key = keystroke_to_key(event);
@@ -252,13 +479,27 @@ impl DocumentView {
 
     fn exec_insert(&mut self, action: ModalAction, cx: &mut Context<Self>) {
         match action {
-            ModalAction::InsertChar(c) => self.insert_char(c, cx),
-            ModalAction::Backspace => self.handle_backspace(cx),
+            ModalAction::InsertChar(c) => {
+                if self.get_selection(cx).is_some() {
+                    self.delete_selection_text(cx);
+                }
+                self.insert_char(c, cx);
+            }
+            ModalAction::Backspace => {
+                if self.get_selection(cx).is_some() {
+                    self.delete_selection_text(cx);
+                } else {
+                    self.handle_backspace(cx);
+                }
+            }
+            ModalAction::DeleteForward => self.delete_forward(cx),
+            ModalAction::SelectAll => self.do_select_all(cx),
             ModalAction::SplitBlock => self.split_block(cx),
             ModalAction::CycleElementType => self.cycle_element(cx),
             ModalAction::Undo => self.do_undo(cx),
             ModalAction::Redo => self.do_redo(cx),
             ModalAction::MoveCursor { motion, count } => {
+                self.set_selection(None, cx);
                 self.apply_motion_insert(motion, count, cx);
             }
             ModalAction::EnterNormal | ModalAction::None => {}
@@ -293,6 +534,15 @@ impl DocumentView {
                         self.cursor_char =
                             self.cursor_char.min(self.char_count(self.focused_block, cx));
                     }
+                }
+                LineStart => { self.cursor_char = 0; }
+                LineEnd => {
+                    self.cursor_char = self.char_count(self.focused_block, cx);
+                }
+                FirstBlock => { self.focused_block = 0; self.cursor_char = 0; }
+                LastBlock => {
+                    self.focused_block = self.block_count(cx).saturating_sub(1);
+                    self.cursor_char = self.char_count(self.focused_block, cx);
                 }
                 _ => {}
             }
@@ -561,14 +811,22 @@ impl Render for DocumentView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = self.status_bar_text(cx).into();
         let block_views = self.block_views.clone();
+        let context_menu = self.context_menu;
+        let sidebar_open = self.sidebar_open;
 
-        div()
+        let mut root = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x1c1c1c))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.context_menu = Some(event.position);
+                this.sidebar_open = false;
+                cx.notify();
+            }))
             .child(
                 div()
                     .id("scroll-area")
@@ -576,7 +834,6 @@ impl Render for DocumentView {
                     .w_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    // Centering row: pushes the fixed-width page to the horizontal centre
                     .child(
                         div()
                             .w_full()
@@ -585,7 +842,6 @@ impl Render for DocumentView {
                             .pt(px(40.0))
                             .pb(px(40.0))
                             .child(
-                                // Fixed-width page — 700px so block padding reliably clips text
                                 div()
                                     .w(px(700.0))
                                     .min_h(px(1056.0))
@@ -612,8 +868,267 @@ impl Render for DocumentView {
                             .text_size(px(11.0))
                             .child(status),
                     ),
+            );
+
+        // Hamburger button — always visible, top-left corner.
+        root = root.child(
+            div()
+                .absolute()
+                .top(px(12.0))
+                .left(px(14.0))
+                .w(px(32.0))
+                .h(px(32.0))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .items_center()
+                .gap(px(5.0))
+                .cursor_pointer()
+                .rounded_md()
+                .hover(|s| s.bg(rgb(0x3a3a3a)))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_open = !this.sidebar_open;
+                    this.context_menu = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }))
+                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
+                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
+                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa))),
+        );
+
+        // Sidebar panel.
+        if sidebar_open {
+            // Dismiss overlay behind the sidebar.
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    })),
+            );
+            root = root.child(self.render_sidebar(cx));
+        }
+
+        if let Some(pos) = context_menu {
+            // Full-screen transparent overlay: any click outside menu dismisses it.
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    })),
+            );
+            root = root.child(self.render_context_menu(pos, cx));
+        }
+
+        root
+    }
+}
+
+impl DocumentView {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let item_style = |d: Div| {
+            d.px(px(16.0))
+                .py(px(10.0))
+                .text_size(px(13.0))
+                .text_color(hsla(0.0, 0.0, 0.85, 1.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x383838)))
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(220.0))
+            .h_full()
+            .bg(rgb(0x222222))
+            .border_r_1()
+            .border_color(rgb(0x3a3a3a))
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            // Header
+            .child(
+                div()
+                    .h(px(52.0))
+                    .px(px(16.0))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(0x3a3a3a))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(hsla(0.0, 0.0, 0.6, 1.0))
+                            .child("Menu"),
+                    ),
+            )
+            // Open File item
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.do_open_file(window, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(hsla(0.0, 0.0, 0.55, 1.0))
+                            .child("⌂"),
+                    )
+                    .child(div().child("Open File…")),
             )
     }
+
+    fn render_context_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row_style = |d: Div| {
+            d.px(px(14.0))
+                .py(px(5.0))
+                .text_size(px(12.0))
+                .text_color(hsla(0.0, 0.0, 0.85, 1.0))
+                .hover(|s| s.bg(rgb(0x3a3a3a)))
+                .cursor_pointer()
+        };
+
+        div()
+            .absolute()
+            .left(pos.x)
+            .top(pos.y)
+            .w(px(160.0))
+            .bg(rgb(0x2a2a2a))
+            .border_1()
+            .border_color(rgb(0x484848))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .py(px(4.0))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                row_style(div())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.copy_selection(window, cx);
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+                    .child("Copy        Ctrl+C"),
+            )
+            .child(
+                row_style(div())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.do_cut(window, cx);
+                        this.context_menu = None;
+                        this.push_cursor(cx);
+                        cx.notify();
+                    }))
+                    .child("Cut         Ctrl+X"),
+            )
+            .child(
+                row_style(div())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.do_paste(cx);
+                        this.context_menu = None;
+                        this.push_cursor(cx);
+                        cx.notify();
+                    }))
+                    .child("Paste       Ctrl+V"),
+            )
+            .child(div().h(px(1.0)).mx(px(8.0)).my(px(3.0)).bg(rgb(0x444444)))
+            .child(
+                row_style(div())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.do_select_all(cx);
+                        this.context_menu = None;
+                        this.push_cursor(cx);
+                        cx.notify();
+                    }))
+                    .child("Select All  Ctrl+A"),
+            )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
+}
+
+/// Subprocess-based file picker fallback for when the xdg-desktop-portal
+/// is not available. Tries zenity (GTK) then kdialog (Qt/KDE).
+async fn pick_file_subprocess() -> Option<std::path::PathBuf> {
+    let (tx, rx) = futures::channel::oneshot::channel::<Option<std::path::PathBuf>>();
+    std::thread::spawn(move || {
+        // Try zenity (GTK / most desktop environments)
+        let zenity = std::process::Command::new("zenity")
+            .args(["--file-selection", "--title=Open Fountain Script",
+                   "--file-filter=Fountain Files (*.fountain)|*.fountain",
+                   "--file-filter=All Files|*"])
+            .output();
+        if let Ok(out) = zenity {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    tx.send(Some(std::path::PathBuf::from(s))).ok();
+                    return;
+                }
+            } else if out.status.code() != Some(1) {
+                // exit 1 = user cancelled; other codes = not installed / error
+                eprintln!("zenity cancelled");
+                tx.send(None).ok();
+                return;
+            }
+        }
+
+        // Try kdialog (KDE / Qt environments)
+        let kdialog = std::process::Command::new("kdialog")
+            .args(["--getopenfilename", ".", "*.fountain|Fountain Files\n*.*|All Files"])
+            .output();
+        if let Ok(out) = kdialog {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    tx.send(Some(std::path::PathBuf::from(s))).ok();
+                    return;
+                }
+            }
+        }
+
+        eprintln!("no file picker available (install zenity or kdialog)");
+        tx.send(None).ok();
+    });
+
+    rx.await.ok().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -632,11 +1147,14 @@ fn keystroke_to_key(event: &KeyDownEvent) -> Key {
         "escape" => return Key::Escape,
         "enter" | "return" => return Key::Enter,
         "backspace" => return Key::Backspace,
+        "delete" => return Key::Delete,
+        "home" => return Key::Home,
+        "end" => return Key::End,
         "tab" => return Key::Tab,
-        "left" => return Key::Char('h'),
-        "right" => return Key::Char('l'),
-        "up" => return Key::Char('k'),
-        "down" => return Key::Char('j'),
+        "left" => return Key::ArrowLeft,
+        "right" => return Key::ArrowRight,
+        "up" => return Key::ArrowUp,
+        "down" => return Key::ArrowDown,
         _ => {}
     }
 

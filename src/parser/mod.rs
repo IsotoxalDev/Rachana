@@ -37,6 +37,7 @@ pub fn parse(source: &str) -> Document {
                 title,
                 author,
                 dirty: false,
+                path: None,
             };
         }
     };
@@ -80,7 +81,7 @@ pub fn parse(source: &str) -> Document {
         blocks.push(Block::new(FountainElement::Action, String::new(), String::new()));
     }
 
-    Document { blocks, title, author, dirty: false }
+    Document { blocks, title, author, dirty: false, path: None }
 }
 
 fn push_blocks(blocks: &mut Vec<Block>, pair: pest::iterators::Pair<Rule>, raw: String) {
@@ -142,7 +143,7 @@ fn push_blocks(blocks: &mut Vec<Block>, pair: pest::iterators::Pair<Rule>, raw: 
                     continue;
                 }
                 if let Some(content) = line_pair.into_inner().next() {
-                    let cr = content.as_str().to_string();
+                    let cr = content.as_str().trim_end_matches('\n').trim_end_matches('\r').to_string();
                     let el = match content.as_rule() {
                         Rule::parenthetical => FountainElement::Parenthetical,
                         _ => FountainElement::Dialogue,
@@ -152,11 +153,11 @@ fn push_blocks(blocks: &mut Vec<Block>, pair: pest::iterators::Pair<Rule>, raw: 
             }
         }
         Rule::action_block => {
-            let text = pair.as_str().to_string();
+            let text = pair.as_str().trim_end_matches('\n').trim_end_matches('\r').to_string();
             blocks.push(Block::new(FountainElement::Action, text.clone(), raw));
         }
         _ => {
-            let text = pair.as_str().to_string();
+            let text = pair.as_str().trim_end_matches('\n').trim_end_matches('\r').to_string();
             blocks.push(Block::new(FountainElement::Action, text.clone(), raw));
         }
     }

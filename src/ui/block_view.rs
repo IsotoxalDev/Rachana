@@ -2,9 +2,20 @@ use std::ops::Range;
 
 use gpui::*;
 
-use crate::model::Document;
+use crate::model::{Document, FountainElement};
 use crate::ui::modal::ModalState;
 use crate::ui::text_runs::{element_style, ElementStyle, TextAlign as StyleAlign};
+
+/// Emitted when the user left-clicks inside a block to position the cursor.
+pub struct CursorClicked {
+    pub char_idx: usize,
+}
+
+/// Emitted when the user right-clicks inside a block.
+pub struct RightClicked {
+    pub position: Point<Pixels>,
+    pub char_idx: usize,
+}
 
 pub struct BlockView {
     pub block_index: usize,
@@ -13,8 +24,13 @@ pub struct BlockView {
     pub focused: bool,
     pub cursor_char: usize,
     pub selection: Option<Range<usize>>,
+    /// Character index of the drag start, used to extend selection on mouse-move.
+    drag_anchor: Option<usize>,
     focus_handle: FocusHandle,
 }
+
+impl EventEmitter<CursorClicked> for BlockView {}
+impl EventEmitter<RightClicked> for BlockView {}
 
 impl BlockView {
     pub fn new(
@@ -30,25 +46,82 @@ impl BlockView {
             focused: false,
             cursor_char: 0,
             selection: None,
+            drag_anchor: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Return the character index (in the block's raw/uppercased text) that
+    /// corresponds to the given window-space X coordinate.
+    fn compute_cursor(&self, click_x: Pixels, window: &Window, cx: &mut Context<Self>) -> usize {
+        let (text, element) = {
+            let doc = self.document.read(cx);
+            let Some(block) = doc.blocks.get(self.block_index) else { return 0 };
+            (block.text.clone(), block.element.clone())
+        };
+
+        let style = element_style(&element);
+        // Replace newlines with spaces so shape_line doesn't panic; char count stays the same.
+        let raw: String = {
+            let s = if style.uppercase { text.to_uppercase() } else { text };
+            s.replace('\n', " ")
+        };
+        if raw.is_empty() { return 0; }
+
+        // Work in raw f32 to avoid Pixels private field access.
+        let viewport_w = window.viewport_size().width.as_f32();
+        let page_left   = (viewport_w - 700.0) / 2.0;
+        let content_left  = page_left + style.left_pad.as_f32();
+        let content_width = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
+
+        let run = make_run(&style, raw.len(), None, false, false);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(raw.clone()),
+            style.font_size,
+            &[run],
+            None,
+        );
+        let total_width = shaped.width().as_f32();
+
+        // Offset of the text's left edge within the content area (accounts for alignment).
+        let text_indent: f32 = match style.text_align {
+            StyleAlign::Left   => 0.0,
+            StyleAlign::Right  => (content_width - total_width).max(0.0),
+            StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
+        };
+
+        let click_in_text = click_x.as_f32() - content_left - text_indent;
+        if click_in_text <= 0.0 { return 0; }
+
+        let chars: Vec<char> = raw.chars().collect();
+        let mut byte_offset = 0usize;
+        let mut x_prev = 0.0f32;
+        for (i, ch) in chars.iter().enumerate() {
+            byte_offset += ch.len_utf8();
+            let x_next = shaped.split_at(byte_offset).0.width().as_f32();
+            // Snap to nearest character boundary.
+            if click_in_text <= (x_prev + x_next) / 2.0 {
+                return i;
+            }
+            x_prev = x_next;
+        }
+        chars.len()
     }
 }
 
 impl Render for BlockView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let read = {
             let doc = self.document.read(cx);
             doc.blocks
                 .get(self.block_index)
                 .map(|b| (b.element.clone(), b.text.clone()))
         };
-
         let Some((element, text)) = read else {
             return div().w_full().min_h(px(22.0));
         };
 
-        // No bottom gap when the next block is part of the same speech unit.
+        // Gap suppression: no bottom margin within a speech unit
         let next_element = {
             let doc = self.document.read(cx);
             doc.blocks.get(self.block_index + 1).map(|b| b.element.clone())
@@ -56,38 +129,25 @@ impl Render for BlockView {
         let suppress_gap = matches!(
             (&element, &next_element),
             (
-                crate::model::FountainElement::Character
-                | crate::model::FountainElement::Dialogue
-                | crate::model::FountainElement::Parenthetical,
+                FountainElement::Character
+                | FountainElement::Dialogue
+                | FountainElement::Parenthetical,
                 Some(
-                    crate::model::FountainElement::Character
-                    | crate::model::FountainElement::Dialogue
-                    | crate::model::FountainElement::Parenthetical
+                    FountainElement::Character
+                    | FountainElement::Dialogue
+                    | FountainElement::Parenthetical
                 )
             )
         );
 
         let style = element_style(&element);
-        let raw = if style.uppercase { text.to_uppercase() } else { text.clone() };
+        let mb = if suppress_gap { px(0.0) } else { px(8.0) };
 
-        // Focused: show raw markup so the writer can edit the markers.
-        // Unfocused: render **bold** / *italic* as styled runs, hide the markers.
-        let (display, runs) = if self.focused {
-            let display: SharedString = if raw.is_empty() { " ".into() } else { raw.into() };
-            let runs = build_runs(&display, &style, true, self.cursor_char, &self.selection);
-            (display, runs)
-        } else {
-            let (processed, runs) = render_inline_markup(&raw, &style);
-            let display: SharedString = if processed.is_empty() { "".into() } else { processed.into() };
-            (display, runs)
-        };
-
-        let fh = self.focus_handle.clone();
-
-        let d = div()
+        // Common container style shared by both focused and unfocused paths.
+        let container = div()
             .w_full()
             .min_h(style.line_height)
-            .mb(if suppress_gap { px(0.0) } else { px(8.0) })
+            .mb(mb)
             .pl(style.left_pad)
             .pr(style.right_pad)
             .text_size(style.font_size)
@@ -95,120 +155,98 @@ impl Render for BlockView {
             .whitespace_normal()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                fh.focus(window, cx);
-            });
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.focus_handle.clone().focus(window, cx);
+                let char_idx = this.compute_cursor(event.position.x, window, cx);
+                this.drag_anchor = Some(char_idx);
+                this.cursor_char = char_idx;
+                this.selection = None;
+                cx.emit(CursorClicked { char_idx });
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.focus_handle.clone().focus(window, cx);
+                let char_idx = this.compute_cursor(event.position.x, window, cx);
+                this.cursor_char = char_idx;
+                this.drag_anchor = None;
+                cx.emit(CursorClicked { char_idx });
+                cx.emit(RightClicked { position: event.position, char_idx });
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                this.drag_anchor = None;
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    if let Some(anchor) = this.drag_anchor {
+                        let cur = this.compute_cursor(event.position.x, window, cx);
+                        let (start, end) = (anchor.min(cur), anchor.max(cur));
+                        this.selection = if start < end { Some(start..end) } else { None };
+                        this.cursor_char = cur;
+                        cx.notify();
+                    }
+                } else {
+                    this.drag_anchor = None;
+                }
+            }));
 
-        let d = match style.text_align {
-            StyleAlign::Right => d.text_right(),
-            StyleAlign::Center => d.text_center(),
-            StyleAlign::Left => d,
+        let container = match style.text_align {
+            StyleAlign::Right => container.text_right(),
+            StyleAlign::Center => container.text_center(),
+            StyleAlign::Left => container,
         };
 
-        d.child(StyledText::new(display).with_runs(runs))
+        if self.focused {
+            let raw = if style.uppercase { text.to_uppercase() } else { text.clone() };
+            let char_count = raw.chars().count();
+            let clamp = self.cursor_char.min(char_count);
+
+            // Compute cursor pixel position, accounting for word-wrap at the
+            // element's content width. Newlines are replaced with spaces so
+            // shape_line doesn't panic; char count is preserved.
+            let before_measure: String =
+                raw.chars().take(clamp).collect::<String>().replace('\n', " ");
+            let wrap_width = px(700.0) - style.left_pad - style.right_pad;
+            let cursor_pt = cursor_position_wrapped(
+                &before_measure, &style, wrap_width, style.line_height, window,
+            );
+
+            let cursor_color = Hsla { h: 0.0, s: 0.0, l: 0.95, a: 1.0 };
+            let cursor_bar = div()
+                .absolute()
+                .left(cursor_pt.x)
+                .top(cursor_pt.y)
+                .w(px(2.0))
+                .h(style.line_height)
+                .bg(cursor_color);
+
+            // Render text normally (with optional selection bg) on the layer below.
+            let full_runs = build_selection_runs(&raw, &style, &self.selection);
+            let inner = div()
+                .relative()
+                .w_full()
+                .min_h(style.line_height)
+                .child(cursor_bar)
+                .child(StyledText::new(SharedString::from(raw)).with_runs(full_runs));
+
+            container.child(inner)
+        } else {
+            // Unfocused: process inline markup (**bold**, *italic*, _underline_).
+            // Keep newlines — multi-line blocks like title page need them for display.
+            let raw = if style.uppercase { text.to_uppercase() } else { text.clone() };
+            let (display, runs) = if self.selection.is_some() {
+                // Show raw text with selection highlight
+                let s = text.clone();
+                let runs = build_selection_runs(&s, &style, &self.selection);
+                (s, runs)
+            } else {
+                render_inline_markup(&raw, &style)
+            };
+            container.child(StyledText::new(SharedString::from(display)).with_runs(runs))
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Inline markup renderer (unfocused blocks only)
-// ---------------------------------------------------------------------------
-
-/// Parse **bold** and *italic* markers, return (display_text, runs).
-/// Markers are stripped from display_text; formatting is expressed via TextRun font fields.
-fn render_inline_markup(text: &str, style: &ElementStyle) -> (String, Vec<TextRun>) {
-    if text.is_empty() {
-        return (String::new(), vec![make_run(style, 0, None, false, false)]);
-    }
-    if !text.contains('*') && !text.contains('_') {
-        return (text.to_string(), vec![make_run(style, text.len(), None, false, false)]);
-    }
-
-    let mut display = String::new();
-    let mut runs: Vec<TextRun> = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-
-    // Accumulate a plain segment, flush into a run when we hit markup.
-    let mut plain = String::new();
-
-    let flush_plain = |plain: &mut String, display: &mut String, runs: &mut Vec<TextRun>| {
-        if !plain.is_empty() {
-            let bytes = plain.len();
-            display.push_str(plain);
-            runs.push(make_run(style, bytes, None, false, false));
-            plain.clear();
-        }
-    };
-
-    while i < n {
-        // **bold**
-        if i + 1 < n && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(close) = find_close(&chars, i + 2, "**") {
-                flush_plain(&mut plain, &mut display, &mut runs);
-                let content: String = chars[i + 2..close].iter().collect();
-                display.push_str(&content);
-                runs.push(make_run(style, content.len(), None, true, false));
-                i = close + 2;
-                continue;
-            }
-        }
-        // *italic* (only when not **)
-        if chars[i] == '*' {
-            if let Some(close) = find_close(&chars, i + 1, "*") {
-                flush_plain(&mut plain, &mut display, &mut runs);
-                let content: String = chars[i + 1..close].iter().collect();
-                display.push_str(&content);
-                runs.push(make_run(style, content.len(), None, false, true));
-                i = close + 1;
-                continue;
-            }
-        }
-        // _underline_
-        if chars[i] == '_' {
-            if let Some(close) = find_close(&chars, i + 1, "_") {
-                flush_plain(&mut plain, &mut display, &mut runs);
-                let content: String = chars[i + 1..close].iter().collect();
-                display.push_str(&content);
-                let mut run = make_run(style, content.len(), None, false, false);
-                run.underline = Some(UnderlineStyle {
-                    color: Some(style.color),
-                    thickness: px(1.0),
-                    wavy: false,
-                });
-                runs.push(run);
-                i = close + 1;
-                continue;
-            }
-        }
-        plain.push(chars[i]);
-        i += 1;
-    }
-    flush_plain(&mut plain, &mut display, &mut runs);
-
-    if runs.is_empty() {
-        runs.push(make_run(style, display.len(), None, false, false));
-    }
-    (display, runs)
-}
-
-/// Find the closing marker starting at `from`, returns char index of first marker char.
-fn find_close(chars: &[char], from: usize, marker: &str) -> Option<usize> {
-    let mc: Vec<char> = marker.chars().collect();
-    let mlen = mc.len();
-    let n = chars.len();
-    let mut i = from;
-    while i + mlen <= n {
-        if chars[i..i + mlen] == mc[..] {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Run construction (focused / cursor / selection)
+// Run helpers
 // ---------------------------------------------------------------------------
 
 fn make_run(style: &ElementStyle, len: usize, bg: Option<Hsla>, bold: bool, italic: bool) -> TextRun {
@@ -228,6 +266,90 @@ fn make_run(style: &ElementStyle, len: usize, bg: Option<Hsla>, bold: bool, ital
     }
 }
 
+fn plain_runs(text: &str, style: &ElementStyle) -> Vec<TextRun> {
+    if text.is_empty() {
+        vec![make_run(style, 0, None, false, false)]
+    } else {
+        vec![make_run(style, text.len(), None, false, false)]
+    }
+}
+
+/// Compute the pixel position of the cursor (top-left of the cursor bar) within
+/// a text block, accounting for word-wrap at `wrap_width`.
+///
+/// `before` is the text to the left of the cursor with newlines already replaced
+/// by spaces (shape_line panics on newlines).
+fn cursor_position_wrapped(
+    before: &str,
+    style: &ElementStyle,
+    wrap_width: Pixels,
+    line_height: Pixels,
+    window: &Window,
+) -> Point<Pixels> {
+    if before.is_empty() {
+        return point(px(0.0), px(0.0));
+    }
+
+    let run = make_run(style, before.len(), None, false, false);
+    let shaped = window.text_system().shape_line(
+        SharedString::from(before.to_string()),
+        style.font_size,
+        &[run],
+        None,
+    );
+
+    // Find where each visual line starts (byte offset into `before`).
+    let wrap_starts = find_wrap_starts(before, &shaped, wrap_width);
+
+    let visual_line = wrap_starts.len();
+    let last_start_byte = wrap_starts.last().copied().unwrap_or(0);
+    let last_start_x = if last_start_byte == 0 {
+        px(0.0)
+    } else {
+        shaped.split_at(last_start_byte).0.width()
+    };
+
+    let cursor_x = shaped.width() - last_start_x;
+    point(cursor_x, line_height * visual_line as f32)
+}
+
+/// Return the byte offsets in `text` where each new visual line starts,
+/// using the same greedy word-wrap logic as GPUI's text renderer.
+fn find_wrap_starts(text: &str, shaped: &ShapedLine, wrap_width: Pixels) -> Vec<usize> {
+    let mut wrap_starts: Vec<usize> = Vec::new();
+    let mut line_start_byte = 0usize;
+    let mut line_start_x = px(0.0);
+    // (byte_offset, x_offset) of the most recent word-start candidate
+    let mut last_word_start: Option<(usize, Pixels)> = None;
+    let mut prev_ch = '\0';
+
+    for (byte_offset, ch) in text.char_indices() {
+        let next_byte = byte_offset + ch.len_utf8();
+
+        // Track word-start positions: transition from whitespace to non-whitespace.
+        if prev_ch == ' ' && ch != ' ' {
+            let x = shaped.split_at(byte_offset).0.width();
+            last_word_start = Some((byte_offset, x));
+        }
+
+        let char_end_x = shaped.split_at(next_byte).0.width();
+
+        if char_end_x - line_start_x > wrap_width && byte_offset > line_start_byte {
+            let (new_byte, new_x) = last_word_start.unwrap_or_else(|| {
+                (byte_offset, shaped.split_at(byte_offset).0.width())
+            });
+            line_start_byte = new_byte;
+            line_start_x = new_x;
+            wrap_starts.push(new_byte);
+            last_word_start = None;
+        }
+
+        prev_ch = ch;
+    }
+
+    wrap_starts
+}
+
 fn char_to_byte(text: &str, char_idx: usize) -> usize {
     text.char_indices()
         .nth(char_idx)
@@ -235,42 +357,112 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn build_runs(
-    text: &str,
-    style: &ElementStyle,
-    focused: bool,
-    cursor_char: usize,
-    selection: &Option<Range<usize>>,
-) -> Vec<TextRun> {
+fn build_selection_runs(text: &str, style: &ElementStyle, selection: &Option<Range<usize>>) -> Vec<TextRun> {
+    let Some(sel) = selection else {
+        return vec![make_run(style, text.len(), None, false, false)];
+    };
+    let s = char_to_byte(text, sel.start).min(text.len());
+    let e = char_to_byte(text, sel.end).min(text.len());
+    let sel_bg = Hsla { h: 0.60, s: 0.50, l: 0.50, a: 0.40 };
+    let mut runs = Vec::new();
+    if s > 0 { runs.push(make_run(style, s, None, false, false)); }
+    if e > s { runs.push(make_run(style, e - s, Some(sel_bg), false, false)); }
+    if e < text.len() { runs.push(make_run(style, text.len() - e, None, false, false)); }
+    if runs.is_empty() { runs.push(make_run(style, text.len(), None, false, false)); }
+    runs
+}
+
+// ---------------------------------------------------------------------------
+// Inline markup renderer (unfocused only)
+// ---------------------------------------------------------------------------
+
+fn render_inline_markup(text: &str, style: &ElementStyle) -> (String, Vec<TextRun>) {
     if text.is_empty() {
-        return vec![make_run(style, 0, None, false, false)];
+        return (String::new(), vec![make_run(style, 0, None, false, false)]);
+    }
+    if !text.contains('*') && !text.contains('_') {
+        return (text.to_string(), vec![make_run(style, text.len(), None, false, false)]);
     }
 
-    if let Some(sel) = selection {
-        let s = char_to_byte(text, sel.start).min(text.len());
-        let e = char_to_byte(text, sel.end).min(text.len());
-        let sel_bg = Hsla { h: 0.60, s: 0.50, l: 0.50, a: 0.40 };
-        let mut runs = Vec::new();
-        if s > 0 { runs.push(make_run(style, s, None, false, false)); }
-        if e > s { runs.push(make_run(style, e - s, Some(sel_bg), false, false)); }
-        if e < text.len() { runs.push(make_run(style, text.len() - e, None, false, false)); }
-        if runs.is_empty() { runs.push(make_run(style, text.len(), None, false, false)); }
-        return runs;
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut display = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+
+    macro_rules! flush {
+        () => {
+            if !plain.is_empty() {
+                let bytes = plain.len();
+                display.push_str(&plain);
+                runs.push(make_run(style, bytes, None, false, false));
+                plain.clear();
+            }
+        };
     }
 
-    if focused {
-        let cb = char_to_byte(text, cursor_char);
-        if cb < text.len() {
-            let ch_len = text[cb..].chars().next().map_or(1, |c| c.len_utf8());
-            let nb = cb + ch_len;
-            let cur_bg = Hsla { h: 0.0, s: 0.0, l: 0.85, a: 0.80 };
-            let mut runs = Vec::new();
-            if cb > 0 { runs.push(make_run(style, cb, None, false, false)); }
-            runs.push(make_run(style, ch_len, Some(cur_bg), false, false));
-            if nb < text.len() { runs.push(make_run(style, text.len() - nb, None, false, false)); }
-            return runs;
+    while i < n {
+        // **bold**
+        if i + 1 < n && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(close) = find_close(&chars, i + 2, "**") {
+                flush!();
+                let content: String = chars[i + 2..close].iter().collect();
+                display.push_str(&content);
+                runs.push(make_run(style, content.len(), None, true, false));
+                i = close + 2;
+                continue;
+            }
         }
+        // *italic*
+        if chars[i] == '*' {
+            if let Some(close) = find_close(&chars, i + 1, "*") {
+                flush!();
+                let content: String = chars[i + 1..close].iter().collect();
+                display.push_str(&content);
+                runs.push(make_run(style, content.len(), None, false, true));
+                i = close + 1;
+                continue;
+            }
+        }
+        // _underline_
+        if chars[i] == '_' {
+            if let Some(close) = find_close(&chars, i + 1, "_") {
+                flush!();
+                let content: String = chars[i + 1..close].iter().collect();
+                display.push_str(&content);
+                let mut run = make_run(style, content.len(), None, false, false);
+                run.underline = Some(UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.0),
+                    wavy: false,
+                });
+                runs.push(run);
+                i = close + 1;
+                continue;
+            }
+        }
+        plain.push(chars[i]);
+        i += 1;
     }
+    flush!();
 
-    vec![make_run(style, text.len(), None, false, false)]
+    if runs.is_empty() {
+        runs.push(make_run(style, display.len(), None, false, false));
+    }
+    (display, runs)
+}
+
+fn find_close(chars: &[char], from: usize, marker: &str) -> Option<usize> {
+    let mc: Vec<char> = marker.chars().collect();
+    let mlen = mc.len();
+    let n = chars.len();
+    let mut i = from;
+    while i + mlen <= n {
+        if chars[i..i + mlen] == mc[..] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
