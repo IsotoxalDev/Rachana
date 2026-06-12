@@ -973,6 +973,23 @@ impl Render for DocumentView {
                                         .w(px(700.0))
                                         .min_h(px(1056.0))
                                         .bg(rgb(0x252525))
+                                        .rounded(px(5.0))
+                                        .shadow(vec![
+                                            gpui::BoxShadow {
+                                                color: hsla(0.0, 0.0, 0.0, 0.20),
+                                                offset: gpui::point(px(0.0), px(6.0)),
+                                                blur_radius: px(24.0),
+                                                spread_radius: px(0.0),
+                                                inset: false,
+                                            },
+                                            gpui::BoxShadow {
+                                                color: hsla(0.0, 0.0, 0.0, 0.10),
+                                                offset: gpui::point(px(0.0), px(1.0)),
+                                                blur_radius: px(4.0),
+                                                spread_radius: px(0.0),
+                                                inset: false,
+                                            },
+                                        ])
                                         .pt(px(80.0))
                                         .pb(px(80.0))
                                         .flex()

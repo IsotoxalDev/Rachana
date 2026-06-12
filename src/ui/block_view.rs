@@ -245,28 +245,64 @@ impl Render for BlockView {
                 .bg(cursor_color);
 
             // Render text normally (with optional selection bg) on the layer below.
-            let full_runs = build_selection_runs(&raw, &style, &self.selection);
-            let inner = div()
+            let content_w = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
+            let sel_color = hsla(0.60, 0.50, 0.50, 0.40);
+            let text_runs = plain_runs(&raw, &style);
+
+            let mut inner = div()
                 .relative()
                 .w_full()
-                .min_h(style.line_height)
-                .child(cursor_bar)
-                .child(StyledText::new(SharedString::from(raw)).with_runs(full_runs));
+                .min_h(style.line_height);
+
+            // Selection highlight behind text.
+            if let Some(sel) = &self.selection {
+                for (x, y, w, h) in selection_rects(&raw, &style, sel, wrap_width, content_w, window) {
+                    inner = inner.child(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(w))
+                            .h(px(h))
+                            .rounded(px(3.0))
+                            .bg(sel_color),
+                    );
+                }
+            }
+
+            inner = inner
+                .child(StyledText::new(SharedString::from(raw)).with_runs(text_runs))
+                .child(cursor_bar);
 
             container.child(inner)
         } else {
-            // Unfocused: process inline markup (**bold**, *italic*, _underline_).
-            // Keep newlines — multi-line blocks like title page need them for display.
             let raw = if style.uppercase { text.to_uppercase() } else { text.clone() };
-            let (display, runs) = if self.selection.is_some() {
-                // Show raw text with selection highlight
-                let s = text.clone();
-                let runs = build_selection_runs(&s, &style, &self.selection);
-                (s, runs)
+
+            if let Some(sel) = &self.selection {
+                let wrap_width = px(700.0) - style.left_pad - style.right_pad;
+                let content_w = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
+                let sel_color = hsla(0.60, 0.50, 0.50, 0.40);
+                let text_runs = plain_runs(&raw, &style);
+
+                let mut wrapper = div().relative().w_full().min_h(style.line_height);
+                for (x, y, w, h) in selection_rects(&raw, &style, sel, wrap_width, content_w, window) {
+                    wrapper = wrapper.child(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(w))
+                            .h(px(h))
+                            .rounded(px(3.0))
+                            .bg(sel_color),
+                    );
+                }
+                wrapper = wrapper.child(StyledText::new(SharedString::from(raw)).with_runs(text_runs));
+                container.child(wrapper)
             } else {
-                render_inline_markup(&raw, &style)
-            };
-            container.child(StyledText::new(SharedString::from(display)).with_runs(runs))
+                let (display, runs) = render_inline_markup(&raw, &style);
+                container.child(StyledText::new(SharedString::from(display)).with_runs(runs))
+            }
         }
     }
 }
@@ -381,6 +417,103 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(b, _)| b)
         .unwrap_or(text.len())
+}
+
+const SEL_PAD_LEFT: f32 = 2.0;
+
+/// Returns (x, y, width, height) rectangles in block-local coordinates for each
+/// visual-line fragment that falls within `selection`.
+///
+/// Each natural `\n`-delimited line is shaped independently so the rects align
+/// with GPUI's rendered line breaks (rather than treating the whole block as one
+/// long word-wrapped string).
+fn selection_rects(
+    raw: &str,
+    style: &ElementStyle,
+    selection: &Range<usize>,
+    wrap_width: Pixels,
+    content_width: f32,
+    window: &Window,
+) -> Vec<(f32, f32, f32, f32)> {
+    if raw.is_empty() || selection.start >= selection.end { return vec![]; }
+    let s_byte = char_to_byte(raw, selection.start).min(raw.len());
+    let e_byte = char_to_byte(raw, selection.end).min(raw.len());
+    if s_byte >= e_byte { return vec![]; }
+
+    let line_h = style.line_height.as_f32();
+    let mut rects = Vec::new();
+    let mut visual_line_idx: usize = 0;
+    let mut raw_byte_cursor: usize = 0;
+    let mut first_nl = true;
+
+    for natural_line in raw.split('\n') {
+        let nl_start = raw_byte_cursor;
+        let nl_end   = raw_byte_cursor + natural_line.len();
+
+        let run_len = natural_line.len().max(1);
+        let run = make_run(style, run_len, None, false, false);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(natural_line.to_string()),
+            style.font_size,
+            &[run],
+            None,
+        );
+
+        // Alignment indent: only meaningful for the first visual line (single-line
+        // blocks like CHARACTER names that use text_center).
+        let text_indent: f32 = if first_nl {
+            let tw = shaped.width().as_f32();
+            match style.text_align {
+                StyleAlign::Left   => 0.0,
+                StyleAlign::Right  => (content_width - tw).max(0.0),
+                StyleAlign::Center => ((content_width - tw) / 2.0).max(0.0),
+            }
+        } else {
+            0.0
+        };
+        first_nl = false;
+
+        // Word-wrap sub-lines within this natural line.
+        let wrap_starts = find_wrap_starts(natural_line, &shaped, wrap_width);
+        let mut sub_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut prev = 0usize;
+        for &ws in &wrap_starts {
+            sub_ranges.push((prev, ws));
+            prev = ws;
+        }
+        sub_ranges.push((prev, natural_line.len()));
+
+        for (sub_idx, &(sub_s, sub_e)) in sub_ranges.iter().enumerate() {
+            let abs_start = nl_start + sub_s;
+            let abs_end   = nl_start + sub_e;
+
+            let sel_start = s_byte.max(abs_start);
+            let sel_end   = e_byte.min(abs_end);
+
+            if sel_start < sel_end {
+                let sub_abs_x = if sub_s == 0 { 0.0 } else {
+                    shaped.split_at(sub_s).0.width().as_f32()
+                };
+                let x0 = shaped.split_at(sel_start - nl_start).0.width().as_f32() - sub_abs_x;
+                let x1 = shaped.split_at(sel_end   - nl_start).0.width().as_f32() - sub_abs_x;
+                let indent = if sub_idx == 0 { text_indent } else { 0.0 };
+                let y = visual_line_idx as f32 * line_h;
+
+                rects.push((
+                    x0 + indent - SEL_PAD_LEFT,
+                    y,
+                    (x1 - x0).max(0.0) + SEL_PAD_LEFT,
+                    line_h,
+                ));
+            }
+
+            visual_line_idx += 1;
+        }
+
+        raw_byte_cursor = nl_end + 1; // +1 to skip the '\n'
+    }
+
+    rects
 }
 
 fn build_selection_runs(text: &str, style: &ElementStyle, selection: &Option<Range<usize>>) -> Vec<TextRun> {
