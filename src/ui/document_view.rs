@@ -58,6 +58,8 @@ pub struct DocumentView {
     sidebar_open: bool,
     /// Anchor point (block_index, char_index) where a mouse-drag selection started.
     selection_anchor: Option<(usize, usize)>,
+    /// Guard: true while a file open/save dialog is in-flight.
+    dialog_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -122,6 +124,7 @@ impl DocumentView {
             context_menu: None,
             sidebar_open: false,
             selection_anchor: None,
+            dialog_open: false,
             _subscriptions: subs,
         }
     }
@@ -423,6 +426,9 @@ impl DocumentView {
     }
 
     fn do_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog_open { return; }
+        self.dialog_open = true;
+
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -432,29 +438,26 @@ impl DocumentView {
         cx.spawn_in(window, async move |weak_this, cx| {
             let path = match receiver.await {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
-                Ok(Ok(None)) => return,
-                Ok(Err(e)) => {
-                    eprintln!("portal file picker failed: {e}");
-                    pick_file_subprocess().await
+                Ok(Ok(None)) => {
+                    weak_this.update(cx, |this, _| this.dialog_open = false).ok();
+                    return;
                 }
-                Err(_) => pick_file_subprocess().await,
+                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Open).await,
             };
-            let Some(path) = path else { return; };
-            match crate::io::load_fountain(&path) {
-                Ok(doc) => {
-                    weak_this.update(cx, |this, cx| {
-                        this.document.update(cx, |d, _| *d = doc);
-                        this.focused_block = 0;
-                        this.cursor_char = 0;
-                        this.history = EditHistory::new();
-                        this.sidebar_open = false;
-                        this.sync_block_views(cx);
-                        this.push_cursor(cx);
-                        cx.notify();
-                    }).ok();
+            let loaded = path.as_deref().map(crate::io::load_fountain);
+            weak_this.update(cx, |this, cx| {
+                this.dialog_open = false;
+                if let Some(Ok(doc)) = loaded {
+                    this.document.update(cx, |d, _| *d = doc);
+                    this.focused_block = 0;
+                    this.cursor_char = 0;
+                    this.history = EditHistory::new();
+                    this.sidebar_open = false;
+                    this.sync_block_views(cx);
+                    this.push_cursor(cx);
+                    cx.notify();
                 }
-                Err(e) => eprintln!("open error: {e}"),
-            }
+            }).ok();
         }).detach();
     }
 
@@ -469,7 +472,46 @@ impl DocumentView {
                 Ok(()) => { self.document.update(cx, |d, _| d.dirty = false); }
                 Err(e) => eprintln!("save error: {e}"),
             }
+        } else {
+            // No path yet — treat Ctrl+S as Save As.
+            // Can't call do_save_as here because we don't have &mut Window,
+            // so just mark dirty; the caller in handle_key must use do_save_as.
         }
+    }
+
+    fn do_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog_open { return; }
+        self.dialog_open = true;
+
+        let receiver = cx.prompt_for_new_path(&std::path::Path::new("untitled.fountain"), None);
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(p))) => Some(p),
+                Ok(Ok(None)) => {
+                    weak_this.update(cx, |this, _| this.dialog_open = false).ok();
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Save).await,
+            };
+            weak_this.update(cx, |this, cx| {
+                this.dialog_open = false;
+                let Some(p) = path else { return; };
+                let result = {
+                    let doc = this.document.read(cx);
+                    crate::io::save_fountain(&doc, &p)
+                };
+                match result {
+                    Ok(()) => {
+                        this.document.update(cx, |d, _| {
+                            d.path = Some(p);
+                            d.dirty = false;
+                        });
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("save-as error: {e}"),
+                }
+            }).ok();
+        }).detach();
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
@@ -546,7 +588,17 @@ impl DocumentView {
                     return;
                 }
                 "s" if !mods.shift => {
-                    self.do_save(cx);
+                    let has_path = self.document.read(cx).path.is_some();
+                    if has_path {
+                        self.do_save(cx);
+                    } else {
+                        self.do_save_as(window, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "s" if mods.shift => {
+                    self.do_save_as(window, cx);
                     cx.notify();
                     return;
                 }
@@ -1146,13 +1198,37 @@ impl DocumentView {
                         cx.notify();
                         cx.stop_propagation();
                     }))
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .text_color(hsla(0.0, 0.0, 0.55, 1.0))
-                            .child("⌂"),
-                    )
+                    .child(sidebar_icon("icons/open.svg"))
                     .child(div().child("Open File…")),
+            )
+            // Save item
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        let has_path = this.document.read(cx).path.is_some();
+                        if has_path { this.do_save(cx); } else { this.do_save_as(window, cx); }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(sidebar_icon("icons/save.svg"))
+                    .child(div().child("Save")),
+            )
+            // Save As item
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.do_save_as(window, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(sidebar_icon("icons/save.svg"))
+                    .child(div().child("Save As…")),
             )
     }
 
@@ -1237,27 +1313,46 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
     text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
 }
 
-/// Subprocess-based file picker fallback for when the xdg-desktop-portal
+fn sidebar_icon(path: &'static str) -> Svg {
+    svg()
+        .path(path)
+        .w(px(16.0))
+        .h(px(16.0))
+        .text_color(hsla(0.0, 0.0, 0.55, 1.0))
+}
+
+enum DialogMode { Open, Save }
+
+/// Subprocess-based file picker/saver fallback for when the xdg-desktop-portal
 /// is not available. Tries zenity (GTK) then kdialog (Qt/KDE).
-async fn pick_file_subprocess() -> Option<std::path::PathBuf> {
+async fn pick_file_subprocess(mode: DialogMode) -> Option<std::path::PathBuf> {
     let (tx, rx) = futures::channel::oneshot::channel::<Option<std::path::PathBuf>>();
     std::thread::spawn(move || {
+        let is_save = matches!(mode, DialogMode::Save);
+
         // Try zenity (GTK / most desktop environments)
-        let zenity = std::process::Command::new("zenity")
-            .args(["--file-selection", "--title=Open Fountain Script",
-                   "--file-filter=Fountain Files (*.fountain)|*.fountain",
-                   "--file-filter=All Files|*"])
-            .output();
+        let mut zenity_args: Vec<&str> = vec!["--file-selection"];
+        if is_save { zenity_args.push("--save"); }
+        zenity_args.extend_from_slice(&[
+            if is_save { "--title=Save Fountain Script" } else { "--title=Open Fountain Script" },
+            "--file-filter=Fountain Files (*.fountain)|*.fountain",
+            "--file-filter=All Files|*",
+        ]);
+        let zenity = std::process::Command::new("zenity").args(&zenity_args).output();
         if let Ok(out) = zenity {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
-                    tx.send(Some(std::path::PathBuf::from(s))).ok();
+                    let mut path = std::path::PathBuf::from(s);
+                    if is_save && path.extension().is_none() {
+                        path.set_extension("fountain");
+                    }
+                    tx.send(Some(path)).ok();
                     return;
                 }
-            } else if out.status.code() != Some(1) {
-                // exit 1 = user cancelled; other codes = not installed / error
-                eprintln!("zenity cancelled");
+            }
+            // exit 1 = user cancelled → send None and stop; any other code = not installed
+            if out.status.code() == Some(1) {
                 tx.send(None).ok();
                 return;
             }
@@ -1265,13 +1360,21 @@ async fn pick_file_subprocess() -> Option<std::path::PathBuf> {
 
         // Try kdialog (KDE / Qt environments)
         let kdialog = std::process::Command::new("kdialog")
-            .args(["--getopenfilename", ".", "*.fountain|Fountain Files\n*.*|All Files"])
+            .args([
+                if is_save { "--getsavefilename" } else { "--getopenfilename" },
+                ".",
+                "*.fountain|Fountain Files\n*.*|All Files",
+            ])
             .output();
         if let Ok(out) = kdialog {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
-                    tx.send(Some(std::path::PathBuf::from(s))).ok();
+                    let mut path = std::path::PathBuf::from(s);
+                    if is_save && path.extension().is_none() {
+                        path.set_extension("fountain");
+                    }
+                    tx.send(Some(path)).ok();
                     return;
                 }
             }

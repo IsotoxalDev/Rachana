@@ -11,6 +11,7 @@ pub const COURIER_PRIME_ITALIC: &[u8] =
 pub const COURIER_PRIME_BOLD_ITALIC: &[u8] =
     include_bytes!("../../assets/fonts/CourierPrime-BoldItalic.ttf");
 
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAlign {
     Left,
