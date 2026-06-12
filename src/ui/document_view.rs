@@ -278,13 +278,12 @@ impl DocumentView {
 
         let (mut element, _) = parse_block(&text);
 
-        // Context rule: a plain line following CHARACTER, DIALOGUE, or PARENTHETICAL
+        // Context rule: a plain line following CHARACTER or PARENTHETICAL
         // is DIALOGUE unless it was explicitly forced to something else.
         if element == FountainElement::Action {
             let in_dialogue_context = matches!(
                 prev_element,
                 Some(FountainElement::Character)
-                    | Some(FountainElement::Dialogue)
                     | Some(FountainElement::Parenthetical)
             );
             if in_dialogue_context {
@@ -859,7 +858,6 @@ impl DocumentView {
         let current_element = self.document.read(cx).blocks.get(idx).map(|b| b.element.clone());
         let new_element = match current_element {
             Some(FountainElement::Character)
-            | Some(FountainElement::Dialogue)
             | Some(FountainElement::Parenthetical) => FountainElement::Dialogue,
             _ => FountainElement::Action,
         };
@@ -1401,7 +1399,10 @@ fn keystroke_to_key(event: &KeyDownEvent) -> Key {
 
     match ks.key.as_str() {
         "escape" => return Key::Escape,
-        "enter" | "return" => return Key::Enter,
+        "enter" | "return" => {
+            if mods.shift { return Key::ShiftEnter; }
+            return Key::Enter;
+        }
         "backspace" => return Key::Backspace,
         "delete" => return Key::Delete,
         "home" => return Key::Home,

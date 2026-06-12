@@ -9,6 +9,7 @@ pub enum Key {
     Char(char),
     Escape,
     Enter,
+    ShiftEnter,
     Backspace,
     Delete,
     Home,
@@ -90,6 +91,8 @@ pub enum ModalAction {
     Redo,
     /// Placeholder — search is not yet implemented.
     SearchStub,
+    /// Split block and force the new block to Dialogue type (Shift+Enter).
+    SplitBlockDialogue,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +296,7 @@ impl ModalState {
                 ModalAction::None
             }
             Key::Enter => ModalAction::SplitBlock,
+            Key::ShiftEnter => ModalAction::SplitBlockDialogue,
             Key::Tab => ModalAction::CycleElementType,
             Key::Backspace => ModalAction::Backspace,
             Key::Delete => ModalAction::DeleteForward,
