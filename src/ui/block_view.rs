@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::model::{Document, FountainElement};
@@ -57,8 +58,10 @@ impl BlockView {
         }
     }
 
-    /// Return the character index corresponding to the given window-space click position,
-    /// accounting for word-wrapped visual lines.
+    /// Return the character index corresponding to the given window-space click position.
+    ///
+    /// Handles multi-line blocks (TitlePage, long Action) by shaping each `\n`-delimited
+    /// natural line independently — the same approach used by `selection_rects`.
     fn compute_cursor(&self, click_x: Pixels, click_y: Pixels, window: &Window, cx: &mut Context<Self>) -> usize {
         let (text, element) = {
             let doc = self.document.read(cx);
@@ -67,11 +70,8 @@ impl BlockView {
         };
 
         let style = element_style(&element);
-        let raw: String = {
-            let s = if style.uppercase { text.to_uppercase() } else { text };
-            s.replace('\n', " ")
-        };
-        if raw.is_empty() { return 0; }
+        let full_text = if style.uppercase { text.to_uppercase() } else { text };
+        if full_text.is_empty() { return 0; }
 
         let viewport_w = window.viewport_size().width.as_f32();
         let page_left = (viewport_w - 700.0) / 2.0;
@@ -79,70 +79,74 @@ impl BlockView {
         let content_width = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
         let wrap_width = px(content_width);
 
-        let run = make_run(&style, raw.len(), None, false, false);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(raw.clone()),
-            style.font_size,
-            &[run],
-            None,
-        );
-        let total_width = shaped.width().as_f32();
-
-        let text_indent: f32 = match style.text_align {
-            StyleAlign::Left   => 0.0,
-            StyleAlign::Right  => (content_width - total_width).max(0.0),
-            StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
-        };
-
-        // Which visual (wrapped) line was clicked?
         let local_y = (click_y.as_f32() - self.top_y).max(0.0);
         let line_h = style.line_height.as_f32();
-        let visual_line = (local_y / line_h).floor() as usize;
+        let target_vline = (local_y / line_h).floor() as usize;
 
-        let wrap_starts = find_wrap_starts(&raw, &shaped, wrap_width);
-        let num_lines = wrap_starts.len() + 1;
-        let visual_line = visual_line.min(num_lines.saturating_sub(1));
+        let mut visual_idx: usize = 0;
+        let mut char_offset: usize = 0; // chars in full_text before the current natural line
 
-        // Byte range for the clicked visual line.
-        let line_start_byte: usize = if visual_line == 0 {
-            0
-        } else {
-            wrap_starts[visual_line - 1]
-        };
-        let line_end_byte: usize = wrap_starts.get(visual_line).copied().unwrap_or(raw.len());
+        for natural_line in full_text.split('\n') {
+            let nl_chars = natural_line.chars().count();
 
-        // Absolute X offset (in the shaped text) at the start of this visual line.
-        let line_start_abs_x: f32 = if line_start_byte == 0 {
-            0.0
-        } else {
-            shaped.split_at(line_start_byte).0.width().as_f32()
-        };
+            let run = make_run(&style, natural_line.len().max(1), None, false, false);
+            let shaped = window.text_system().shape_line(
+                SharedString::from(natural_line.to_string()),
+                style.font_size,
+                &[run],
+                None,
+            );
 
-        // For wrapped lines beyond the first, the indent resets to 0.
-        let effective_indent = if visual_line == 0 { text_indent } else { 0.0 };
-        let click_in_content = (click_x.as_f32() - content_left - effective_indent).max(0.0);
-        let target_abs_x = click_in_content + line_start_abs_x;
+            let total_width = shaped.width().as_f32();
+            let text_indent: f32 = match style.text_align {
+                StyleAlign::Left   => 0.0,
+                StyleAlign::Right  => (content_width - total_width).max(0.0),
+                StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
+            };
 
-        // Find the character whose midpoint is nearest to target_abs_x.
-        let chars: Vec<char> = raw.chars().collect();
-        let char_start = raw[..line_start_byte].chars().count();
-        let mut cur_byte = line_start_byte;
-        let mut x_prev = line_start_abs_x;
-
-        for ci in char_start..chars.len() {
-            cur_byte += chars[ci].len_utf8();
-            let x_next = shaped.split_at(cur_byte).0.width().as_f32();
-
-            if target_abs_x <= (x_prev + x_next) / 2.0 {
-                return ci;
+            let wrap_starts = find_wrap_starts(natural_line, &shaped, wrap_width);
+            let mut sub_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut prev = 0usize;
+            for &ws in &wrap_starts {
+                sub_ranges.push((prev, ws));
+                prev = ws;
             }
-            x_prev = x_next;
+            sub_ranges.push((prev, natural_line.len()));
 
-            if cur_byte >= line_end_byte {
-                return ci + 1;
+            for (sub_idx, &(sub_s, sub_e)) in sub_ranges.iter().enumerate() {
+                if visual_idx == target_vline {
+                    let sub_abs_x = if sub_s == 0 { 0.0f32 } else {
+                        shaped.split_at(sub_s).0.width().as_f32()
+                    };
+                    let effective_indent = if sub_idx == 0 { text_indent } else { 0.0 };
+                    let click_in_content = (click_x.as_f32() - content_left - effective_indent).max(0.0);
+                    let target_abs_x = click_in_content + sub_abs_x;
+
+                    let chars: Vec<char> = natural_line.chars().collect();
+                    let sub_char_start = natural_line[..sub_s].chars().count();
+                    let mut cur_byte = sub_s;
+                    let mut x_prev = sub_abs_x;
+
+                    for ci in sub_char_start..chars.len() {
+                        cur_byte += chars[ci].len_utf8();
+                        let x_next = shaped.split_at(cur_byte).0.width().as_f32();
+                        if target_abs_x <= (x_prev + x_next) / 2.0 {
+                            return char_offset + ci;
+                        }
+                        x_prev = x_next;
+                        if cur_byte >= sub_e {
+                            return char_offset + ci + 1;
+                        }
+                    }
+                    return char_offset + nl_chars;
+                }
+                visual_idx += 1;
             }
+
+            char_offset += nl_chars + 1; // +1 for the '\n' character
         }
-        chars.len()
+
+        full_text.chars().count()
     }
 }
 
@@ -163,19 +167,20 @@ impl Render for BlockView {
             let doc = self.document.read(cx);
             doc.blocks.get(self.block_index + 1).map(|b| b.element.clone())
         };
-        let suppress_gap = matches!(
-            (&element, &next_element),
-            (
-                FountainElement::Character
-                | FountainElement::Dialogue
-                | FountainElement::Parenthetical,
-                Some(
+        let suppress_gap = element == FountainElement::TitlePage
+            || matches!(
+                (&element, &next_element),
+                (
                     FountainElement::Character
                     | FountainElement::Dialogue
-                    | FountainElement::Parenthetical
+                    | FountainElement::Parenthetical,
+                    Some(
+                        FountainElement::Character
+                        | FountainElement::Dialogue
+                        | FountainElement::Parenthetical
+                    )
                 )
-            )
-        );
+            );
 
         let style = element_style(&element);
         let mb = if suppress_gap { px(0.0) } else { px(8.0) };
@@ -225,11 +230,9 @@ impl Render for BlockView {
             let char_count = raw.chars().count();
             let clamp = self.cursor_char.min(char_count);
 
-            // Compute cursor pixel position, accounting for word-wrap at the
-            // element's content width. Newlines are replaced with spaces so
-            // shape_line doesn't panic; char count is preserved.
-            let before_measure: String =
-                raw.chars().take(clamp).collect::<String>().replace('\n', " ");
+            // Text before the cursor — keep \n characters so cursor_position_wrapped
+            // can place the caret on the correct visual row for multi-line blocks.
+            let before_measure: String = raw.chars().take(clamp).collect();
             let wrap_width = px(700.0) - style.left_pad - style.right_pad;
             let cursor_pt = cursor_position_wrapped(
                 &before_measure, &style, wrap_width, style.line_height, window,
@@ -256,18 +259,8 @@ impl Render for BlockView {
 
             // Selection highlight behind text.
             if let Some(sel) = &self.selection {
-                for (x, y, w, h) in selection_rects(&raw, &style, sel, wrap_width, content_w, window) {
-                    inner = inner.child(
-                        div()
-                            .absolute()
-                            .left(px(x))
-                            .top(px(y))
-                            .w(px(w))
-                            .h(px(h))
-                            .rounded(px(3.0))
-                            .bg(sel_color),
-                    );
-                }
+                let rects = selection_rects(&raw, &style, sel, wrap_width, content_w, window);
+                inner = apply_selection_rects(inner, rects, sel_color);
             }
 
             inner = inner
@@ -284,19 +277,12 @@ impl Render for BlockView {
                 let sel_color = hsla(0.60, 0.50, 0.50, 0.40);
                 let text_runs = plain_runs(&raw, &style);
 
-                let mut wrapper = div().relative().w_full().min_h(style.line_height);
-                for (x, y, w, h) in selection_rects(&raw, &style, sel, wrap_width, content_w, window) {
-                    wrapper = wrapper.child(
-                        div()
-                            .absolute()
-                            .left(px(x))
-                            .top(px(y))
-                            .w(px(w))
-                            .h(px(h))
-                            .rounded(px(3.0))
-                            .bg(sel_color),
-                    );
-                }
+                let rects = selection_rects(&raw, &style, sel, wrap_width, content_w, window);
+                let mut wrapper = apply_selection_rects(
+                    div().relative().w_full().min_h(style.line_height),
+                    rects,
+                    sel_color,
+                );
                 wrapper = wrapper.child(StyledText::new(SharedString::from(raw)).with_runs(text_runs));
                 container.child(wrapper)
             } else {
@@ -337,10 +323,10 @@ fn plain_runs(text: &str, style: &ElementStyle) -> Vec<TextRun> {
 }
 
 /// Compute the pixel position of the cursor (top-left of the cursor bar) within
-/// a text block, accounting for word-wrap at `wrap_width`.
+/// a text block, accounting for word-wrap and real `\n` line breaks.
 ///
-/// `before` is the text to the left of the cursor with newlines already replaced
-/// by spaces (shape_line panics on newlines).
+/// Each `\n`-delimited natural line is shaped independently so that multi-line
+/// blocks (TitlePage, long Action) place the cursor on the correct visual row.
 fn cursor_position_wrapped(
     before: &str,
     style: &ElementStyle,
@@ -352,18 +338,41 @@ fn cursor_position_wrapped(
         return point(px(0.0), px(0.0));
     }
 
-    let run = make_run(style, before.len(), None, false, false);
+    let natural_lines: Vec<&str> = before.split('\n').collect();
+    let mut total_visual: usize = 0;
+
+    // Count visual lines contributed by every natural line except the last.
+    for line in &natural_lines[..natural_lines.len().saturating_sub(1)] {
+        if line.is_empty() {
+            total_visual += 1;
+        } else {
+            let run = make_run(style, line.len(), None, false, false);
+            let shaped = window.text_system().shape_line(
+                SharedString::from(line.to_string()),
+                style.font_size,
+                &[run],
+                None,
+            );
+            total_visual += find_wrap_starts(line, &shaped, wrap_width).len() + 1;
+        }
+    }
+
+    // Last natural line: compute the cursor x and sub-line index.
+    let last = natural_lines.last().copied().unwrap_or("");
+    if last.is_empty() {
+        return point(px(0.0), line_height * total_visual as f32);
+    }
+
+    let run = make_run(style, last.len(), None, false, false);
     let shaped = window.text_system().shape_line(
-        SharedString::from(before.to_string()),
+        SharedString::from(last.to_string()),
         style.font_size,
         &[run],
         None,
     );
 
-    // Find where each visual line starts (byte offset into `before`).
-    let wrap_starts = find_wrap_starts(before, &shaped, wrap_width);
-
-    let visual_line = wrap_starts.len();
+    let wrap_starts = find_wrap_starts(last, &shaped, wrap_width);
+    let sub_line = wrap_starts.len();
     let last_start_byte = wrap_starts.last().copied().unwrap_or(0);
     let last_start_x = if last_start_byte == 0 {
         px(0.0)
@@ -372,7 +381,7 @@ fn cursor_position_wrapped(
     };
 
     let cursor_x = shaped.width() - last_start_x;
-    point(cursor_x, line_height * visual_line as f32)
+    point(cursor_x, line_height * (total_visual + sub_line) as f32)
 }
 
 /// Return the byte offsets in `text` where each new visual line starts,
@@ -419,7 +428,7 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-const SEL_PAD_LEFT: f32 = 2.0;
+const SEL_PAD: f32 = 2.0;
 
 /// Returns (x, y, width, height) rectangles in block-local coordinates for each
 /// visual-line fragment that falls within `selection`.
@@ -490,19 +499,24 @@ fn selection_rects(
             let sel_start = s_byte.max(abs_start);
             let sel_end   = e_byte.min(abs_end);
 
-            if sel_start < sel_end {
+            let y = visual_line_idx as f32 * line_h;
+
+            if natural_line.is_empty() && s_byte <= abs_start && abs_start < e_byte {
+                // Empty natural line inside selection: draw a full-width rect so the
+                // blank line doesn't punch a hole in the highlight.
+                rects.push((-SEL_PAD, y, content_width + 2.0 * SEL_PAD, line_h));
+            } else if sel_start < sel_end {
                 let sub_abs_x = if sub_s == 0 { 0.0 } else {
                     shaped.split_at(sub_s).0.width().as_f32()
                 };
                 let x0 = shaped.split_at(sel_start - nl_start).0.width().as_f32() - sub_abs_x;
                 let x1 = shaped.split_at(sel_end   - nl_start).0.width().as_f32() - sub_abs_x;
                 let indent = if sub_idx == 0 { text_indent } else { 0.0 };
-                let y = visual_line_idx as f32 * line_h;
 
                 rects.push((
-                    x0 + indent - SEL_PAD_LEFT,
+                    x0 + indent - SEL_PAD,
                     y,
-                    (x1 - x0).max(0.0) + SEL_PAD_LEFT,
+                    (x1 - x0).max(0.0) + 2.0 * SEL_PAD,
                     line_h,
                 ));
             }
@@ -514,6 +528,57 @@ fn selection_rects(
     }
 
     rects
+}
+
+/// Append selection highlight children to `target` with adaptive per-corner rounding.
+///
+/// Corner rules (same logic for all four corners):
+/// - First rect: top corners always rounded.
+/// - Last rect: bottom corners always rounded.
+/// - Between adjacent rects: a corner is rounded when the current rect extends
+///   beyond its neighbour on that side (convex); flat when edges are aligned;
+///   flat when the neighbour extends beyond the current (concave, no overlay).
+/// - Rects are pixel-snapped so they touch without gaps or alpha-bleed overlap.
+fn apply_selection_rects(mut target: Div, rects: Vec<(f32, f32, f32, f32)>, color: Hsla) -> Div {
+    let n = rects.len();
+    if n == 0 { return target; }
+
+    // Tolerance for "same edge" — ignores minor word-wrap width variations.
+    const EPS: f32 = 8.0;
+    const R: f32 = 3.0;
+
+    for (i, &(x, y, w, h)) in rects.iter().enumerate() {
+        let right   = x + w;
+        let is_last = i + 1 == n;
+
+        let prev_right = if i > 0 { Some(rects[i - 1].0 + rects[i - 1].2) } else { None };
+        let next_right = if !is_last { Some(rects[i + 1].0 + rects[i + 1].2) } else { None };
+        let prev_left  = if i > 0 { Some(rects[i - 1].0) } else { None };
+        let next_left  = if !is_last { Some(rects[i + 1].0) } else { None };
+
+        // Round a corner when this rect extends past its neighbour on that side.
+        let round_tl = prev_left .map_or(true, |pl| x     < pl - EPS);
+        let round_tr = prev_right.map_or(true, |pr| right > pr + EPS);
+        let round_bl = next_left .map_or(true, |nl| x     < nl - EPS);
+        let round_br = next_right.map_or(true, |nr| right > nr + EPS);
+
+        // Pixel-snap y so adjacent rects touch exactly (no gap, no alpha-bleed overlap).
+        let draw_h = (y + h).round() - y.round();
+
+        target = target.child(
+            div()
+                .absolute()
+                .left(px(x)).top(px(y.round()))
+                .w(px(w)).h(px(draw_h))
+                .bg(color)
+                .when(round_tl, |d| d.rounded_tl(px(R)))
+                .when(round_tr, |d| d.rounded_tr(px(R)))
+                .when(round_bl, |d| d.rounded_bl(px(R)))
+                .when(round_br, |d| d.rounded_br(px(R)))
+        );
+    }
+
+    target
 }
 
 fn build_selection_runs(text: &str, style: &ElementStyle, selection: &Option<Range<usize>>) -> Vec<TextRun> {

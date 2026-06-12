@@ -9,7 +9,9 @@ rest_of_line =  { line_char* }
 title_key   = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | " ")* }
 title_value = { rest_of_line }
 title_item  = { title_key ~ ":" ~ " "* ~ title_value ~ NEWLINE }
-title_page  = { title_item+ ~ BLANK_LINE }
+// Allow a single blank line between title items: consume the extra NEWLINE only
+// when the lookahead confirms another key: pair follows immediately after it.
+title_page  = { (title_item | (NEWLINE ~ &(title_key ~ ":")))+ ~ BLANK_LINE }
 
 // Forced elements
 forced_scene          = { "." ~ !"." ~ rest_of_line }
