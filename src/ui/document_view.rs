@@ -2,7 +2,12 @@ use gpui::*;
 
 use crate::model::{Block, Document, FountainElement};
 use crate::parser::parse_block;
-use crate::ui::block_view::{BlockView, CursorClicked, CursorDragged, RightClicked};
+use crate::ui::block_view::{
+    char_at_visual_line_x, count_visual_lines, visual_line_and_x,
+    BlockView, CursorClicked, CursorDragged, RightClicked, ShiftClicked, WordSelected,
+};
+use crate::ui::text_runs::element_style;
+use crate::ui::file_dialog::{DialogMode, pick_file_subprocess};
 use crate::ui::modal::{InsertPoint, Key, ModalAction, ModalState};
 
 // ---------------------------------------------------------------------------
@@ -109,6 +114,25 @@ impl DocumentView {
                 this.context_menu = Some(event.position);
                 cx.notify();
             }));
+            subs.push(cx.subscribe(bv, |this, bv, event: &WordSelected, cx| {
+                this.context_menu = None;
+                let block_idx = bv.read(cx).block_index;
+                this.focused_block = block_idx;
+                this.selection_anchor = Some((block_idx, event.start));
+                this.cursor_char = event.end;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            subs.push(cx.subscribe(bv, |this, bv, event: &ShiftClicked, cx| {
+                this.context_menu = None;
+                if this.selection_anchor.is_none() {
+                    this.selection_anchor = Some((this.focused_block, this.cursor_char));
+                }
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
         }
 
         Self {
@@ -164,11 +188,30 @@ impl DocumentView {
                 this.context_menu = Some(event.position);
                 cx.notify();
             }));
+            self._subscriptions.push(cx.subscribe(&bv, |this, bv, event: &WordSelected, cx| {
+                this.context_menu = None;
+                let block_idx = bv.read(cx).block_index;
+                this.focused_block = block_idx;
+                this.selection_anchor = Some((block_idx, event.start));
+                this.cursor_char = event.end;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
+            self._subscriptions.push(cx.subscribe(&bv, |this, bv, event: &ShiftClicked, cx| {
+                this.context_menu = None;
+                if this.selection_anchor.is_none() {
+                    this.selection_anchor = Some((this.focused_block, this.cursor_char));
+                }
+                this.focused_block = bv.read(cx).block_index;
+                this.cursor_char = event.char_idx;
+                this.push_cursor(cx);
+                cx.notify();
+            }));
             self.block_views.push(bv);
         }
         self.block_views.truncate(n);
         for (i, bv) in self.block_views.iter().enumerate() {
-            bv.update(cx, |v, _| v.block_index = i);
+            bv.update(cx, |v, cx| { v.block_index = i; cx.notify(); });
         }
     }
 
@@ -177,7 +220,12 @@ impl DocumentView {
             let focused = i == self.focused_block;
             let cur = if focused { self.cursor_char } else { 0 };
             let sel = self.compute_block_selection(i, cx);
-            bv.update(cx, |v, _| { v.focused = focused; v.cursor_char = cur; v.selection = sel; });
+            bv.update(cx, |v, cx| {
+                v.focused = focused;
+                v.cursor_char = cur;
+                v.selection = sel;
+                cx.notify();
+            });
         }
     }
 
@@ -271,22 +319,26 @@ impl DocumentView {
 
     fn re_parse_block(&mut self, idx: usize, cx: &mut Context<Self>) {
         let text = self.text_of(idx, cx);
-        let prev_element = self.document.read(cx).blocks
-            .get(idx.saturating_sub(1))
-            .filter(|_| idx > 0)
-            .map(|b| b.element.clone());
+        let (prev_element, current_element) = {
+            let doc = self.document.read(cx);
+            let prev = doc.blocks.get(idx.saturating_sub(1))
+                .filter(|_| idx > 0)
+                .map(|b| b.element.clone());
+            let cur = doc.blocks.get(idx).map(|b| b.element.clone());
+            (prev, cur)
+        };
 
         let (mut element, _) = parse_block(&text);
 
-        // Context rule: a plain line following CHARACTER or PARENTHETICAL
-        // is DIALOGUE unless it was explicitly forced to something else.
         if element == FountainElement::Action {
             let in_dialogue_context = matches!(
                 prev_element,
-                Some(FountainElement::Character)
-                    | Some(FountainElement::Parenthetical)
+                Some(FountainElement::Character) | Some(FountainElement::Parenthetical)
             );
             if in_dialogue_context {
+                element = FountainElement::Dialogue;
+            } else if current_element == Some(FountainElement::Dialogue) {
+                // Preserve an explicitly-set Dialogue block — don't demote it to Action.
                 element = FountainElement::Dialogue;
             }
         }
@@ -621,9 +673,9 @@ impl DocumentView {
 
         let is_insert = self.modal.read(cx).is_insert_like();
         if is_insert {
-            self.exec_insert(action, cx);
+            self.exec_insert(action, window, cx);
         } else {
-            self.exec_normal(action, cx);
+            self.exec_normal(action, window, cx);
         }
 
         self.push_cursor(cx);
@@ -634,7 +686,7 @@ impl DocumentView {
     // Insert actions
     // -----------------------------------------------------------------------
 
-    fn exec_insert(&mut self, action: ModalAction, cx: &mut Context<Self>) {
+    fn exec_insert(&mut self, action: ModalAction, window: &Window, cx: &mut Context<Self>) {
         match action {
             ModalAction::InsertChar(c) => {
                 if self.has_selection() { self.delete_selection_text(cx); }
@@ -659,6 +711,10 @@ impl DocumentView {
                 if self.has_selection() { self.delete_selection_text(cx); }
                 self.split_block(cx);
             }
+            ModalAction::SplitBlockDialogue => {
+                if self.has_selection() { self.delete_selection_text(cx); }
+                self.split_block_as(FountainElement::Dialogue, cx);
+            }
             ModalAction::CycleElementType => {
                 self.selection_anchor = None;
                 self.cycle_element(cx);
@@ -673,7 +729,19 @@ impl DocumentView {
             }
             ModalAction::MoveCursor { motion, count } => {
                 self.selection_anchor = None;
-                self.apply_motion_insert(motion, count, cx);
+                self.apply_motion_insert(motion, count, window, cx);
+            }
+            ModalAction::SelectWordForward => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some((self.focused_block, self.cursor_char));
+                }
+                self.move_word_forward(cx);
+            }
+            ModalAction::SelectWordBackward => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some((self.focused_block, self.cursor_char));
+                }
+                self.move_word_back(cx);
             }
             ModalAction::EnterNormal | ModalAction::None => {
                 self.selection_anchor = None;
@@ -686,40 +754,35 @@ impl DocumentView {
         &mut self,
         motion: crate::ui::modal::CursorMove,
         count: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         use crate::ui::modal::CursorMove::*;
-        for _ in 0..count {
-            match motion {
-                Left => { if self.cursor_char > 0 { self.cursor_char -= 1; } }
-                Right => {
-                    let max = self.char_count(self.focused_block, cx);
-                    if self.cursor_char < max { self.cursor_char += 1; }
-                }
-                Up => {
-                    if self.focused_block > 0 {
-                        self.focused_block -= 1;
-                        self.cursor_char =
-                            self.cursor_char.min(self.char_count(self.focused_block, cx));
+        match motion {
+            Up   => self.move_visual_up(count, true, window, cx),
+            Down => self.move_visual_down(count, true, window, cx),
+            _ => {
+                for _ in 0..count {
+                    match motion {
+                        Left => { if self.cursor_char > 0 { self.cursor_char -= 1; } }
+                        Right => {
+                            let max = self.char_count(self.focused_block, cx);
+                            if self.cursor_char < max { self.cursor_char += 1; }
+                        }
+                        LineStart => { self.cursor_char = 0; }
+                        LineEnd => {
+                            self.cursor_char = self.char_count(self.focused_block, cx);
+                        }
+                        FirstBlock => { self.focused_block = 0; self.cursor_char = 0; }
+                        LastBlock => {
+                            self.focused_block = self.block_count(cx).saturating_sub(1);
+                            self.cursor_char = self.char_count(self.focused_block, cx);
+                        }
+                        WordForward => self.move_word_forward(cx),
+                        WordBack => self.move_word_back(cx),
+                        _ => {}
                     }
                 }
-                Down => {
-                    if self.focused_block + 1 < self.block_count(cx) {
-                        self.focused_block += 1;
-                        self.cursor_char =
-                            self.cursor_char.min(self.char_count(self.focused_block, cx));
-                    }
-                }
-                LineStart => { self.cursor_char = 0; }
-                LineEnd => {
-                    self.cursor_char = self.char_count(self.focused_block, cx);
-                }
-                FirstBlock => { self.focused_block = 0; self.cursor_char = 0; }
-                LastBlock => {
-                    self.focused_block = self.block_count(cx).saturating_sub(1);
-                    self.cursor_char = self.char_count(self.focused_block, cx);
-                }
-                _ => {}
             }
         }
     }
@@ -728,51 +791,40 @@ impl DocumentView {
     // Normal actions
     // -----------------------------------------------------------------------
 
-    fn exec_normal(&mut self, action: ModalAction, cx: &mut Context<Self>) {
+    fn exec_normal(&mut self, action: ModalAction, window: &Window, cx: &mut Context<Self>) {
         self.selection_anchor = None;
         use crate::ui::modal::CursorMove::*;
         match action {
-            ModalAction::MoveCursor { motion, count } => {
-                for _ in 0..count {
-                    match motion {
-                        Left => { if self.cursor_char > 0 { self.cursor_char -= 1; } }
-                        Right => {
-                            let max = self.char_count(self.focused_block, cx).saturating_sub(1);
-                            if self.cursor_char < max { self.cursor_char += 1; }
-                        }
-                        Up => {
-                            if self.focused_block > 0 {
-                                self.focused_block -= 1;
-                                self.cursor_char = self.cursor_char.min(
-                                    self.char_count(self.focused_block, cx).saturating_sub(1),
-                                );
+            ModalAction::MoveCursor { motion, count } => match motion {
+                Up   => self.move_visual_up(count, false, window, cx),
+                Down => self.move_visual_down(count, false, window, cx),
+                _ => {
+                    for _ in 0..count {
+                        match motion {
+                            Left => { if self.cursor_char > 0 { self.cursor_char -= 1; } }
+                            Right => {
+                                let max = self.char_count(self.focused_block, cx).saturating_sub(1);
+                                if self.cursor_char < max { self.cursor_char += 1; }
                             }
-                        }
-                        Down => {
-                            if self.focused_block + 1 < self.block_count(cx) {
-                                self.focused_block += 1;
-                                self.cursor_char = self.cursor_char.min(
-                                    self.char_count(self.focused_block, cx).saturating_sub(1),
-                                );
+                            LineStart => { self.cursor_char = 0; }
+                            LineEnd => {
+                                self.cursor_char =
+                                    self.char_count(self.focused_block, cx).saturating_sub(1);
                             }
+                            FirstBlock => { self.focused_block = 0; self.cursor_char = 0; }
+                            LastBlock => {
+                                self.focused_block = self.block_count(cx).saturating_sub(1);
+                                self.cursor_char =
+                                    self.char_count(self.focused_block, cx).saturating_sub(1);
+                            }
+                            WordForward => self.move_word_forward(cx),
+                            WordBack => self.move_word_back(cx),
+                            WordEnd => self.move_word_end(cx),
+                            Up | Down => unreachable!(),
                         }
-                        LineStart => { self.cursor_char = 0; }
-                        LineEnd => {
-                            self.cursor_char =
-                                self.char_count(self.focused_block, cx).saturating_sub(1);
-                        }
-                        FirstBlock => { self.focused_block = 0; self.cursor_char = 0; }
-                        LastBlock => {
-                            self.focused_block = self.block_count(cx).saturating_sub(1);
-                            self.cursor_char =
-                                self.char_count(self.focused_block, cx).saturating_sub(1);
-                        }
-                        WordForward => self.move_word_forward(cx),
-                        WordBack => self.move_word_back(cx),
-                        WordEnd => self.move_word_end(cx),
                     }
                 }
-            }
+            },
             ModalAction::EnterInsert(pt) => self.enter_insert_at(pt, cx),
             ModalAction::EnterVisual => {
                 let anchor = self.cursor_char;
@@ -876,6 +928,27 @@ impl DocumentView {
         self.sync_block_views(cx);
     }
 
+    fn split_block_as(&mut self, element: FountainElement, cx: &mut Context<Self>) {
+        let idx = self.focused_block;
+        let (before, after) = {
+            let text = self.text_of(idx, cx);
+            let byte = text.char_indices().nth(self.cursor_char).map(|(b, _)| b).unwrap_or(text.len());
+            (text[..byte].to_string(), text[byte..].to_string())
+        };
+        let new_block = Block::new(element, after.clone(), after);
+        self.mutate(cx, |blocks| {
+            if let Some(b) = blocks.get_mut(idx) {
+                b.text = before.clone();
+                b.raw = before;
+            }
+            blocks.insert(idx + 1, new_block);
+        });
+        self.focused_block = idx + 1;
+        self.cursor_char = 0;
+        self.re_parse_block(idx, cx);
+        self.sync_block_views(cx);
+    }
+
     fn cycle_element(&mut self, cx: &mut Context<Self>) {
         let idx = self.focused_block;
         self.mutate(cx, |blocks| {
@@ -941,6 +1014,70 @@ impl DocumentView {
                 self.mutate(cx, |blocks| blocks.insert(idx, nb));
                 self.cursor_char = 0;
                 self.sync_block_views(cx);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Visual-line motions (j/k and arrow-up/down)
+    // -----------------------------------------------------------------------
+
+    fn move_visual_down(&mut self, count: usize, insert_mode: bool, window: &Window, cx: &mut Context<Self>) {
+        for _ in 0..count {
+            let idx = self.focused_block;
+            let text = self.text_of(idx, cx);
+            let Some(el) = self.document.read(cx).blocks.get(idx).map(|b| b.element.clone()) else { return; };
+            let style = element_style(&el);
+            let display = if style.uppercase { text.to_uppercase() } else { text };
+            let wrap_w = px(700.0 - style.left_pad.as_f32() - style.right_pad.as_f32());
+
+            let (cur_vline, cur_x) = visual_line_and_x(&display, self.cursor_char, &style, wrap_w, window);
+            let total = count_visual_lines(&display, &style, wrap_w, window);
+
+            if cur_vline + 1 < total {
+                let new_char = char_at_visual_line_x(&display, &style, cur_vline + 1, cur_x, wrap_w, window);
+                let max = if insert_mode { self.char_count(idx, cx) } else { self.char_count(idx, cx).saturating_sub(1) };
+                self.cursor_char = new_char.min(max);
+            } else if idx + 1 < self.block_count(cx) {
+                self.focused_block += 1;
+                let next_text = self.text_of(self.focused_block, cx);
+                let Some(nel) = self.document.read(cx).blocks.get(self.focused_block).map(|b| b.element.clone()) else { return; };
+                let ns = element_style(&nel);
+                let next_display = if ns.uppercase { next_text.to_uppercase() } else { next_text };
+                let nw = px(700.0 - ns.left_pad.as_f32() - ns.right_pad.as_f32());
+                let new_char = char_at_visual_line_x(&next_display, &ns, 0, cur_x, nw, window);
+                let max = if insert_mode { self.char_count(self.focused_block, cx) } else { self.char_count(self.focused_block, cx).saturating_sub(1) };
+                self.cursor_char = new_char.min(max);
+            }
+        }
+    }
+
+    fn move_visual_up(&mut self, count: usize, insert_mode: bool, window: &Window, cx: &mut Context<Self>) {
+        for _ in 0..count {
+            let idx = self.focused_block;
+            let text = self.text_of(idx, cx);
+            let Some(el) = self.document.read(cx).blocks.get(idx).map(|b| b.element.clone()) else { return; };
+            let style = element_style(&el);
+            let display = if style.uppercase { text.to_uppercase() } else { text };
+            let wrap_w = px(700.0 - style.left_pad.as_f32() - style.right_pad.as_f32());
+
+            let (cur_vline, cur_x) = visual_line_and_x(&display, self.cursor_char, &style, wrap_w, window);
+
+            if cur_vline > 0 {
+                let new_char = char_at_visual_line_x(&display, &style, cur_vline - 1, cur_x, wrap_w, window);
+                let max = if insert_mode { self.char_count(idx, cx) } else { self.char_count(idx, cx).saturating_sub(1) };
+                self.cursor_char = new_char.min(max);
+            } else if idx > 0 {
+                self.focused_block -= 1;
+                let prev_text = self.text_of(self.focused_block, cx);
+                let Some(pel) = self.document.read(cx).blocks.get(self.focused_block).map(|b| b.element.clone()) else { return; };
+                let ps = element_style(&pel);
+                let prev_display = if ps.uppercase { prev_text.to_uppercase() } else { prev_text };
+                let pw = px(700.0 - ps.left_pad.as_f32() - ps.right_pad.as_f32());
+                let total_prev = count_visual_lines(&prev_display, &ps, pw, window);
+                let new_char = char_at_visual_line_x(&prev_display, &ps, total_prev - 1, cur_x, pw, window);
+                let max = if insert_mode { self.char_count(self.focused_block, cx) } else { self.char_count(self.focused_block, cx).saturating_sub(1) };
+                self.cursor_char = new_char.min(max);
             }
         }
     }
@@ -1146,6 +1283,7 @@ impl Render for DocumentView {
 
 impl DocumentView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let vim_enabled = self.modal.read(cx).enabled;
         let item_style = |d: Div| {
             d.px(px(16.0))
                 .py(px(10.0))
@@ -1226,7 +1364,35 @@ impl DocumentView {
                         cx.stop_propagation();
                     }))
                     .child(sidebar_icon("icons/save.svg"))
-                    .child(div().child("Save As…")),
+                    .child(div().child("Save As\u{2026}")),
+            )
+            .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.modal.update(cx, |m, _| m.toggle_vim());
+                        this.sidebar_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(if vim_enabled {
+                                hsla(0.0, 0.0, 0.85, 1.0)
+                            } else {
+                                hsla(0.0, 0.0, 0.0, 0.0)
+                            })
+                            .child("\u{2713}"),
+                    )
+                    .child(div().child("Vim Mode")),
             )
     }
 
@@ -1319,72 +1485,6 @@ fn sidebar_icon(path: &'static str) -> Svg {
         .text_color(hsla(0.0, 0.0, 0.55, 1.0))
 }
 
-enum DialogMode { Open, Save }
-
-/// Subprocess-based file picker/saver fallback for when the xdg-desktop-portal
-/// is not available. Tries zenity (GTK) then kdialog (Qt/KDE).
-async fn pick_file_subprocess(mode: DialogMode) -> Option<std::path::PathBuf> {
-    let (tx, rx) = futures::channel::oneshot::channel::<Option<std::path::PathBuf>>();
-    std::thread::spawn(move || {
-        let is_save = matches!(mode, DialogMode::Save);
-
-        // Try zenity (GTK / most desktop environments)
-        let mut zenity_args: Vec<&str> = vec!["--file-selection"];
-        if is_save { zenity_args.push("--save"); }
-        zenity_args.extend_from_slice(&[
-            if is_save { "--title=Save Fountain Script" } else { "--title=Open Fountain Script" },
-            "--file-filter=Fountain Files (*.fountain)|*.fountain",
-            "--file-filter=All Files|*",
-        ]);
-        let zenity = std::process::Command::new("zenity").args(&zenity_args).output();
-        if let Ok(out) = zenity {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    let mut path = std::path::PathBuf::from(s);
-                    if is_save && path.extension().is_none() {
-                        path.set_extension("fountain");
-                    }
-                    tx.send(Some(path)).ok();
-                    return;
-                }
-            }
-            // exit 1 = user cancelled → send None and stop; any other code = not installed
-            if out.status.code() == Some(1) {
-                tx.send(None).ok();
-                return;
-            }
-        }
-
-        // Try kdialog (KDE / Qt environments)
-        let kdialog = std::process::Command::new("kdialog")
-            .args([
-                if is_save { "--getsavefilename" } else { "--getopenfilename" },
-                ".",
-                "*.fountain|Fountain Files\n*.*|All Files",
-            ])
-            .output();
-        if let Ok(out) = kdialog {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    let mut path = std::path::PathBuf::from(s);
-                    if is_save && path.extension().is_none() {
-                        path.set_extension("fountain");
-                    }
-                    tx.send(Some(path)).ok();
-                    return;
-                }
-            }
-        }
-
-        eprintln!("no file picker available (install zenity or kdialog)");
-        tx.send(None).ok();
-    });
-
-    rx.await.ok().flatten()
-}
-
 // ---------------------------------------------------------------------------
 // Keystroke → Key
 // ---------------------------------------------------------------------------
@@ -1408,8 +1508,16 @@ fn keystroke_to_key(event: &KeyDownEvent) -> Key {
         "home" => return Key::Home,
         "end" => return Key::End,
         "tab" => return Key::Tab,
-        "left" => return Key::ArrowLeft,
-        "right" => return Key::ArrowRight,
+        "left" => {
+            if mods.control && mods.shift { return Key::CtrlShiftArrowLeft; }
+            if mods.control { return Key::CtrlArrowLeft; }
+            return Key::ArrowLeft;
+        }
+        "right" => {
+            if mods.control && mods.shift { return Key::CtrlShiftArrowRight; }
+            if mods.control { return Key::CtrlArrowRight; }
+            return Key::ArrowRight;
+        }
         "up" => return Key::ArrowUp,
         "down" => return Key::ArrowDown,
         _ => {}

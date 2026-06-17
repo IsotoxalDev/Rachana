@@ -4,7 +4,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::model::{Document, FountainElement};
-use crate::ui::modal::ModalState;
+use crate::ui::modal::{EditorMode, ModalState};
 use crate::ui::text_runs::{element_style, ElementStyle, TextAlign as StyleAlign};
 
 /// Emitted when the user left-clicks inside a block to position the cursor.
@@ -23,6 +23,17 @@ pub struct CursorDragged {
     pub char_idx: usize,
 }
 
+/// Emitted when the user double-clicks a word.
+pub struct WordSelected {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Emitted when the user shift-clicks to extend the selection.
+pub struct ShiftClicked {
+    pub char_idx: usize,
+}
+
 pub struct BlockView {
     pub block_index: usize,
     pub document: Entity<Document>,
@@ -38,6 +49,8 @@ pub struct BlockView {
 impl EventEmitter<CursorClicked> for BlockView {}
 impl EventEmitter<RightClicked> for BlockView {}
 impl EventEmitter<CursorDragged> for BlockView {}
+impl EventEmitter<WordSelected> for BlockView {}
+impl EventEmitter<ShiftClicked> for BlockView {}
 
 impl BlockView {
     pub fn new(
@@ -200,9 +213,26 @@ impl Render for BlockView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.clone().focus(window, cx);
                 let char_idx = this.compute_cursor(event.position.x, event.position.y, window, cx);
-                this.cursor_char = char_idx;
-                this.selection = None;
-                cx.emit(CursorClicked { char_idx });
+                if event.click_count >= 3 {
+                    let char_count = this.document.read(cx)
+                        .blocks.get(this.block_index)
+                        .map(|b| b.text.chars().count())
+                        .unwrap_or(0);
+                    cx.emit(WordSelected { start: 0, end: char_count });
+                } else if event.click_count >= 2 {
+                    let text = this.document.read(cx)
+                        .blocks.get(this.block_index)
+                        .map(|b| b.text.clone())
+                        .unwrap_or_default();
+                    let range = word_range_at(&text, char_idx);
+                    cx.emit(WordSelected { start: range.start, end: range.end });
+                } else if event.modifiers.shift {
+                    cx.emit(ShiftClicked { char_idx });
+                } else {
+                    this.cursor_char = char_idx;
+                    this.selection = None;
+                    cx.emit(CursorClicked { char_idx });
+                }
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.focus_handle.clone().focus(window, cx);
@@ -238,14 +268,39 @@ impl Render for BlockView {
                 &before_measure, &style, wrap_width, style.line_height, window,
             );
 
-            let cursor_color = Hsla { h: 0.0, s: 0.0, l: 0.95, a: 1.0 };
-            let cursor_bar = div()
-                .absolute()
-                .left(cursor_pt.x)
-                .top(cursor_pt.y)
-                .w(px(2.0))
-                .h(style.line_height)
-                .bg(cursor_color);
+            let vim_normal = {
+                let m = self.modal.read(cx);
+                m.enabled && matches!(m.mode, EditorMode::Normal | EditorMode::Visual { .. })
+            };
+
+            let cursor_bar = if vim_normal {
+                let char_w = raw.chars().nth(clamp)
+                    .filter(|ch| *ch != '\n')
+                    .map(|ch| {
+                        let s = ch.to_string();
+                        let run = make_run(&style, s.len(), None, false, false);
+                        let shaped = window.text_system().shape_line(
+                            SharedString::from(s), style.font_size, &[run], None,
+                        );
+                        shaped.width().max(px(2.0))
+                    })
+                    .unwrap_or_else(|| px(style.font_size.as_f32() * 0.6));
+                div()
+                    .absolute()
+                    .left(cursor_pt.x)
+                    .top(cursor_pt.y)
+                    .w(char_w)
+                    .h(style.line_height)
+                    .bg(Hsla { h: 0.0, s: 0.0, l: 0.95, a: 1.0 })
+            } else {
+                div()
+                    .absolute()
+                    .left(cursor_pt.x)
+                    .top(cursor_pt.y)
+                    .w(px(2.0))
+                    .h(style.line_height)
+                    .bg(Hsla { h: 0.0, s: 0.0, l: 0.95, a: 1.0 })
+            };
 
             // Render text normally (with optional selection bg) on the layer below.
             let content_w = 700.0 - style.left_pad.as_f32() - style.right_pad.as_f32();
@@ -263,9 +318,17 @@ impl Render for BlockView {
                 inner = apply_selection_rects(inner, rects, sel_color);
             }
 
-            inner = inner
-                .child(StyledText::new(SharedString::from(raw)).with_runs(text_runs))
-                .child(cursor_bar);
+            // Block cursor goes behind text so the character remains readable;
+            // line cursor goes in front (it's only 2px so it doesn't obscure text).
+            if vim_normal {
+                inner = inner
+                    .child(cursor_bar)
+                    .child(StyledText::new(SharedString::from(raw)).with_runs(text_runs));
+            } else {
+                inner = inner
+                    .child(StyledText::new(SharedString::from(raw)).with_runs(text_runs))
+                    .child(cursor_bar);
+            }
 
             container.child(inner)
         } else {
@@ -291,6 +354,172 @@ impl Render for BlockView {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Visual-line helpers (used by DocumentView for j/k navigation)
+// ---------------------------------------------------------------------------
+
+/// Returns the visual-line index and content-local x offset (pixels from the
+/// left edge of the wrap segment) for `cursor_char` within `text`.
+///
+/// Uses the full text so that wrap boundaries are computed from the real layout,
+/// not from a truncated prefix (which would appear to fit in fewer lines).
+pub(crate) fn visual_line_and_x(
+    text: &str,
+    cursor_char: usize,
+    style: &ElementStyle,
+    wrap_width: Pixels,
+    window: &Window,
+) -> (usize, f32) {
+    let mut visual_idx = 0usize;
+    let mut char_offset = 0usize;
+
+    for nl in text.split('\n') {
+        let nl_chars = nl.chars().count();
+
+        if nl.is_empty() {
+            if cursor_char == char_offset {
+                return (visual_idx, 0.0);
+            }
+            visual_idx += 1;
+            char_offset += 1;
+            continue;
+        }
+
+        let run = make_run(style, nl.len(), None, false, false);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(nl.to_string()), style.font_size, &[run], None,
+        );
+        let wrap_starts = find_wrap_starts(nl, &shaped, wrap_width);
+
+        let mut sub_starts: Vec<usize> = vec![0];
+        sub_starts.extend(&wrap_starts);
+        let n_segs = sub_starts.len();
+
+        for seg_idx in 0..n_segs {
+            let sub_s = sub_starts[seg_idx];
+            let sub_e = if seg_idx + 1 < n_segs { sub_starts[seg_idx + 1] } else { nl.len() };
+            let seg_char_start = char_offset + nl[..sub_s].chars().count();
+            let seg_char_end   = char_offset + nl[..sub_e].chars().count();
+            let is_last_seg    = seg_idx + 1 == n_segs;
+
+            let in_seg = cursor_char >= seg_char_start
+                && (cursor_char < seg_char_end || (is_last_seg && cursor_char == seg_char_end));
+
+            if in_seg {
+                let chars_in     = cursor_char - seg_char_start;
+                let byte_in      = sub_s + nl[sub_s..].chars().take(chars_in).map(|c| c.len_utf8()).sum::<usize>();
+                let seg_start_x  = if sub_s == 0 { 0.0 } else { shaped.split_at(sub_s).0.width().as_f32() };
+                let cursor_abs_x = shaped.split_at(byte_in).0.width().as_f32();
+                return (visual_idx, cursor_abs_x - seg_start_x);
+            }
+
+            visual_idx += 1;
+        }
+
+        char_offset += nl_chars + 1;
+    }
+
+    (visual_idx.saturating_sub(1), 0.0)
+}
+
+/// Returns the total number of visual lines in `text` given the wrap width.
+pub(crate) fn count_visual_lines(
+    text: &str,
+    style: &ElementStyle,
+    wrap_width: Pixels,
+    window: &Window,
+) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    let mut total = 0usize;
+    for nl in text.split('\n') {
+        if nl.is_empty() {
+            total += 1;
+            continue;
+        }
+        let run = make_run(style, nl.len(), None, false, false);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(nl.to_string()), style.font_size, &[run], None,
+        );
+        total += find_wrap_starts(nl, &shaped, wrap_width).len() + 1;
+    }
+    total
+}
+
+/// Returns the char index in `text` that best matches `target_x` on `visual_line`.
+/// `target_x` is pixels from the left of the wrap segment (content-relative,
+/// same coordinate space that `visual_line_and_x` returns).
+pub(crate) fn char_at_visual_line_x(
+    text: &str,
+    style: &ElementStyle,
+    visual_line: usize,
+    target_x: f32,
+    wrap_width: Pixels,
+    window: &Window,
+) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut visual_idx = 0usize;
+    let mut char_offset = 0usize;
+
+    for nl in text.split('\n') {
+        let nl_chars = nl.chars().count();
+
+        if nl.is_empty() {
+            if visual_idx == visual_line {
+                return char_offset;
+            }
+            visual_idx += 1;
+            char_offset += 1;
+            continue;
+        }
+
+        let run = make_run(style, nl.len(), None, false, false);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(nl.to_string()), style.font_size, &[run], None,
+        );
+        let wrap_starts = find_wrap_starts(nl, &shaped, wrap_width);
+
+        let mut sub_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut prev = 0usize;
+        for &ws in &wrap_starts {
+            sub_ranges.push((prev, ws));
+            prev = ws;
+        }
+        sub_ranges.push((prev, nl.len()));
+
+        for &(sub_s, sub_e) in &sub_ranges {
+            if visual_idx == visual_line {
+                let sub_abs_x = if sub_s == 0 { 0.0f32 } else {
+                    shaped.split_at(sub_s).0.width().as_f32()
+                };
+                let abs_target = target_x + sub_abs_x;
+                let chars: Vec<char> = nl.chars().collect();
+                let sub_char_start = nl[..sub_s].chars().count();
+                let sub_char_end   = nl[..sub_e].chars().count();
+                let mut cur_byte = sub_s;
+                let mut x_prev = sub_abs_x;
+                for ci in sub_char_start..sub_char_end {
+                    cur_byte += chars[ci].len_utf8();
+                    let x_next = shaped.split_at(cur_byte).0.width().as_f32();
+                    if abs_target <= (x_prev + x_next) / 2.0 {
+                        return char_offset + ci;
+                    }
+                    x_prev = x_next;
+                }
+                return char_offset + sub_char_end;
+            }
+            visual_idx += 1;
+        }
+
+        char_offset += nl_chars + 1; // +1 for '\n'
+    }
+
+    text.chars().count()
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +648,22 @@ fn find_wrap_starts(text: &str, shaped: &ShapedLine, wrap_width: Pixels) -> Vec<
     }
 
     wrap_starts
+}
+
+fn word_range_at(text: &str, char_idx: usize) -> std::ops::Range<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 { return 0..0; }
+    let i = char_idx.min(n.saturating_sub(1));
+    let is_word = |c: char| c.is_alphanumeric() || c == '\'' || c == '-' || c == '_';
+    if !is_word(chars[i]) {
+        return i..(i + 1).min(n);
+    }
+    let mut start = i;
+    let mut end = i + 1;
+    while start > 0 && is_word(chars[start - 1]) { start -= 1; }
+    while end < n && is_word(chars[end]) { end += 1; }
+    start..end
 }
 
 fn char_to_byte(text: &str, char_idx: usize) -> usize {

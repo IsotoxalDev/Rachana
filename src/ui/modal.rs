@@ -21,6 +21,10 @@ pub enum Key {
     ArrowRight,
     ArrowUp,
     ArrowDown,
+    CtrlArrowLeft,
+    CtrlArrowRight,
+    CtrlShiftArrowLeft,
+    CtrlShiftArrowRight,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +97,10 @@ pub enum ModalAction {
     SearchStub,
     /// Split block and force the new block to Dialogue type (Shift+Enter).
     SplitBlockDialogue,
+    /// Extend selection by one word to the right (Ctrl+Shift+Right).
+    SelectWordForward,
+    /// Extend selection by one word to the left (Ctrl+Shift+Left).
+    SelectWordBackward,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +314,10 @@ impl ModalState {
             Key::ArrowRight => ModalAction::MoveCursor { motion: CursorMove::Right, count: 1 },
             Key::ArrowUp    => ModalAction::MoveCursor { motion: CursorMove::Up,    count: 1 },
             Key::ArrowDown  => ModalAction::MoveCursor { motion: CursorMove::Down,  count: 1 },
+            Key::CtrlArrowLeft  => ModalAction::MoveCursor { motion: CursorMove::WordBack,    count: 1 },
+            Key::CtrlArrowRight => ModalAction::MoveCursor { motion: CursorMove::WordForward, count: 1 },
+            Key::CtrlShiftArrowLeft  => ModalAction::SelectWordBackward,
+            Key::CtrlShiftArrowRight => ModalAction::SelectWordForward,
             Key::Char(c) if !c.is_control() => ModalAction::InsertChar(c),
             _ => ModalAction::None,
         }
