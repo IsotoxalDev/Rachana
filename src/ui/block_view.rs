@@ -260,13 +260,9 @@ impl Render for BlockView {
             let char_count = raw.chars().count();
             let clamp = self.cursor_char.min(char_count);
 
-            // Text before the cursor — keep \n characters so cursor_position_wrapped
-            // can place the caret on the correct visual row for multi-line blocks.
-            let before_measure: String = raw.chars().take(clamp).collect();
             let wrap_width = px(700.0) - style.left_pad - style.right_pad;
-            let cursor_pt = cursor_position_wrapped(
-                &before_measure, &style, wrap_width, style.line_height, window,
-            );
+            let (vline, cur_x) = visual_line_and_x(&raw, clamp, &style, wrap_width, window);
+            let cursor_pt = point(px(cur_x), style.line_height * vline as f32);
 
             let vim_normal = {
                 let m = self.modal.read(cx);
@@ -551,67 +547,6 @@ fn plain_runs(text: &str, style: &ElementStyle) -> Vec<TextRun> {
     }
 }
 
-/// Compute the pixel position of the cursor (top-left of the cursor bar) within
-/// a text block, accounting for word-wrap and real `\n` line breaks.
-///
-/// Each `\n`-delimited natural line is shaped independently so that multi-line
-/// blocks (TitlePage, long Action) place the cursor on the correct visual row.
-fn cursor_position_wrapped(
-    before: &str,
-    style: &ElementStyle,
-    wrap_width: Pixels,
-    line_height: Pixels,
-    window: &Window,
-) -> Point<Pixels> {
-    if before.is_empty() {
-        return point(px(0.0), px(0.0));
-    }
-
-    let natural_lines: Vec<&str> = before.split('\n').collect();
-    let mut total_visual: usize = 0;
-
-    // Count visual lines contributed by every natural line except the last.
-    for line in &natural_lines[..natural_lines.len().saturating_sub(1)] {
-        if line.is_empty() {
-            total_visual += 1;
-        } else {
-            let run = make_run(style, line.len(), None, false, false);
-            let shaped = window.text_system().shape_line(
-                SharedString::from(line.to_string()),
-                style.font_size,
-                &[run],
-                None,
-            );
-            total_visual += find_wrap_starts(line, &shaped, wrap_width).len() + 1;
-        }
-    }
-
-    // Last natural line: compute the cursor x and sub-line index.
-    let last = natural_lines.last().copied().unwrap_or("");
-    if last.is_empty() {
-        return point(px(0.0), line_height * total_visual as f32);
-    }
-
-    let run = make_run(style, last.len(), None, false, false);
-    let shaped = window.text_system().shape_line(
-        SharedString::from(last.to_string()),
-        style.font_size,
-        &[run],
-        None,
-    );
-
-    let wrap_starts = find_wrap_starts(last, &shaped, wrap_width);
-    let sub_line = wrap_starts.len();
-    let last_start_byte = wrap_starts.last().copied().unwrap_or(0);
-    let last_start_x = if last_start_byte == 0 {
-        px(0.0)
-    } else {
-        shaped.split_at(last_start_byte).0.width()
-    };
-
-    let cursor_x = shaped.width() - last_start_x;
-    point(cursor_x, line_height * (total_visual + sub_line) as f32)
-}
 
 /// Return the byte offsets in `text` where each new visual line starts,
 /// using the same greedy word-wrap logic as GPUI's text renderer.

@@ -6,6 +6,7 @@ mod export;
 mod io;
 mod model;
 mod parser;
+mod settings;
 mod ui;
 
 use model::Document;
@@ -59,6 +60,8 @@ fn main() {
                 ..Default::default()
             };
 
+            let app_settings = settings::load();
+
             cx.open_window(options, |_window, cx| {
                 let initial_doc = if std::env::var("TESTING").as_deref() == Ok("1") {
                     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -78,7 +81,13 @@ fn main() {
                 };
 
                 let document = cx.new(|_| initial_doc);
-                let modal = cx.new(|_| ModalState::new());
+                let modal = cx.new(|_| {
+                    let mut m = ModalState::new();
+                    if app_settings.vim_enabled {
+                        m.toggle_vim();
+                    }
+                    m
+                });
                 cx.new(|cx| DocumentView::new(document, modal, cx))
             })
             .unwrap();

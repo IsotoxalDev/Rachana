@@ -565,6 +565,12 @@ impl DocumentView {
         }).detach();
     }
 
+    fn do_toggle_vim(&mut self, cx: &mut Context<Self>) {
+        self.modal.update(cx, |m, _| m.toggle_vim());
+        let vim_enabled = self.modal.read(cx).enabled;
+        crate::settings::save(&crate::settings::Settings { vim_enabled });
+    }
+
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
         let idx = self.focused_block;
         let count = self.char_count(idx, cx);
@@ -607,7 +613,7 @@ impl DocumentView {
 
         // Ctrl+Alt+V — toggle vim regardless of mode.
         if mods.control && mods.alt && ks.key == "v" {
-            self.modal.update(cx, |m, _| m.toggle_vim());
+            self.do_toggle_vim(cx);
             cx.notify();
             return;
         }
@@ -1373,7 +1379,7 @@ impl DocumentView {
                     .items_center()
                     .gap(px(10.0))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                        this.modal.update(cx, |m, _| m.toggle_vim());
+                        this.do_toggle_vim(cx);
                         this.sidebar_open = false;
                         cx.notify();
                         cx.stop_propagation();
