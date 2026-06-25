@@ -21,6 +21,7 @@ struct EmbeddedAssets;
 impl AssetSource for EmbeddedAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: &'static [u8] = match path {
+            "icons/new.svg"  => include_bytes!("../assets/icons/new.svg"),
             "icons/open.svg" => include_bytes!("../assets/icons/open.svg"),
             "icons/save.svg" => include_bytes!("../assets/icons/save.svg"),
             _ => return Ok(None),
@@ -45,6 +46,8 @@ fn main() {
                     Cow::Borrowed(COURIER_PRIME_BOLD_ITALIC),
                 ])
                 .ok();
+
+            cx.set_prompt_builder(ui::prompt::build_prompt);
 
             let size = size(px(1280.0), px(800.0));
             let options = WindowOptions {

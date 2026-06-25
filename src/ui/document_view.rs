@@ -476,6 +476,98 @@ impl DocumentView {
         self.cursor_char = last_len;
     }
 
+    fn reset_to_new(&mut self, cx: &mut Context<Self>) {
+        self.document.update(cx, |d, _| *d = Document::new());
+        self.focused_block = 0;
+        self.cursor_char = 0;
+        self.history = EditHistory::new();
+        self.sidebar_open = false;
+        self.selection_anchor = None;
+        self.sync_block_views(cx);
+        self.push_cursor(cx);
+        cx.notify();
+    }
+
+    fn do_new_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.document.read(cx).dirty {
+            self.reset_to_new(cx);
+            return;
+        }
+
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            "Unsaved Changes",
+            Some("Do you want to save the current script before creating a new one?"),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let Ok(choice) = receiver.await else { return; };
+            match choice {
+                0 => {
+                    // "Save" — save synchronously if we have a path, otherwise show Save As.
+                    let rx = weak_this.update(cx, |this, cx| -> Option<_> {
+                        if this.document.read(cx).path.is_some() {
+                            this.do_save(cx);
+                            Some(None) // saved; no dialog needed
+                        } else if this.dialog_open {
+                            None // blocked
+                        } else {
+                            this.dialog_open = true;
+                            let rx = cx.prompt_for_new_path(
+                                &std::path::Path::new("untitled.fountain"), None
+                            );
+                            Some(Some(rx))
+                        }
+                    });
+
+                    match rx {
+                        Ok(Some(None)) => {
+                            // Had a path, saved; now reset.
+                            weak_this.update(cx, |this, cx| this.reset_to_new(cx)).ok();
+                        }
+                        Ok(Some(Some(path_rx))) => {
+                            // No path — wait for Save As dialog.
+                            let path = match path_rx.await {
+                                Ok(Ok(Some(p))) => Some(p),
+                                Ok(Ok(None)) => {
+                                    weak_this.update(cx, |this, _| this.dialog_open = false).ok();
+                                    return;
+                                }
+                                Ok(Err(_)) | Err(_) => {
+                                    pick_file_subprocess(DialogMode::Save).await
+                                }
+                            };
+                            weak_this.update(cx, |this, cx| {
+                                this.dialog_open = false;
+                                if let Some(p) = path {
+                                    let ok = {
+                                        let doc = this.document.read(cx);
+                                        crate::io::save_fountain(&doc, &p).is_ok()
+                                    };
+                                    if ok {
+                                        this.document.update(cx, |d, _| {
+                                            d.path = Some(p);
+                                            d.dirty = false;
+                                        });
+                                    }
+                                    this.reset_to_new(cx);
+                                }
+                            }).ok();
+                        }
+                        _ => {} // entity gone or dialog already open
+                    }
+                }
+                1 => {
+                    // "Don't Save" — discard changes and reset.
+                    weak_this.update(cx, |this, cx| this.reset_to_new(cx)).ok();
+                }
+                _ => {} // "Cancel" — do nothing
+            }
+        }).detach();
+    }
+
     fn do_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog_open { return; }
         self.dialog_open = true;
@@ -1328,6 +1420,19 @@ impl DocumentView {
                             .text_color(hsla(0.0, 0.0, 0.6, 1.0))
                             .child("Menu"),
                     ),
+            )
+            // New Script item
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.do_new_script(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(sidebar_icon("icons/new.svg"))
+                    .child(div().child("New Script")),
             )
             // Open File item
             .child(
