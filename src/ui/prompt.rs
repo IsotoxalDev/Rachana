@@ -1,5 +1,7 @@
 use gpui::*;
 
+use crate::ui::overlay::modal_overlay;
+
 pub struct PromptRenderer {
     message: String,
     detail: Option<String>,
@@ -82,29 +84,7 @@ impl Render for PromptRenderer {
                 row
             });
 
-        div()
-            .size_full()
-            // Backdrop
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(hsla(0.0, 0.0, 0.0, 0.5)),
-            )
-            // Centered dialog
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(dialog),
-            )
+        modal_overlay(0.5, dialog, cx)
     }
 }
 

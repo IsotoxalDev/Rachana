@@ -2,5 +2,8 @@ pub mod block_view;
 pub mod document_view;
 pub mod file_dialog;
 pub mod modal;
+pub mod overlay;
 pub mod prompt;
+pub mod properties;
+pub mod text_field;
 pub mod text_runs;

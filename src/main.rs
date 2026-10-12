@@ -12,6 +12,10 @@ mod ui;
 use model::Document;
 use ui::document_view::DocumentView;
 use ui::modal::ModalState;
+use ui::text_field::{
+    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right,
+    SelectAll, SelectLeft, SelectRight,
+};
 use ui::text_runs::{
     COURIER_PRIME_BOLD, COURIER_PRIME_BOLD_ITALIC, COURIER_PRIME_ITALIC, COURIER_PRIME_REGULAR,
 };
@@ -21,9 +25,10 @@ struct EmbeddedAssets;
 impl AssetSource for EmbeddedAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: &'static [u8] = match path {
-            "icons/new.svg"  => include_bytes!("../assets/icons/new.svg"),
-            "icons/open.svg" => include_bytes!("../assets/icons/open.svg"),
-            "icons/save.svg" => include_bytes!("../assets/icons/save.svg"),
+            "icons/new.svg"        => include_bytes!("../assets/icons/new.svg"),
+            "icons/open.svg"       => include_bytes!("../assets/icons/open.svg"),
+            "icons/properties.svg" => include_bytes!("../assets/icons/properties.svg"),
+            "icons/save.svg"       => include_bytes!("../assets/icons/save.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
@@ -49,6 +54,21 @@ fn main() {
 
             cx.set_prompt_builder(ui::prompt::build_prompt);
 
+            cx.bind_keys([
+                KeyBinding::new("backspace",   Backspace,    Some("TextField")),
+                KeyBinding::new("delete",       Delete,       Some("TextField")),
+                KeyBinding::new("left",         Left,         Some("TextField")),
+                KeyBinding::new("right",        Right,        Some("TextField")),
+                KeyBinding::new("shift-left",   SelectLeft,   Some("TextField")),
+                KeyBinding::new("shift-right",  SelectRight,  Some("TextField")),
+                KeyBinding::new("ctrl-a",       SelectAll,    Some("TextField")),
+                KeyBinding::new("home",         Home,         Some("TextField")),
+                KeyBinding::new("end",          End,          Some("TextField")),
+                KeyBinding::new("ctrl-v",       Paste,        Some("TextField")),
+                KeyBinding::new("ctrl-c",       Copy,         Some("TextField")),
+                KeyBinding::new("ctrl-x",       Cut,          Some("TextField")),
+            ]);
+
             let size = size(px(1280.0), px(800.0));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size, cx)),
@@ -65,7 +85,7 @@ fn main() {
 
             let app_settings = settings::load();
 
-            cx.open_window(options, |_window, cx| {
+            cx.open_window(options, |window, cx| {
                 let initial_doc = if std::env::var("TESTING").as_deref() == Ok("1") {
                     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                         .join("example/Big-Fish.fountain");
@@ -91,7 +111,7 @@ fn main() {
                     }
                     m
                 });
-                cx.new(|cx| DocumentView::new(document, modal, cx))
+                cx.new(|cx| DocumentView::new(document, modal, window, cx))
             })
             .unwrap();
         });

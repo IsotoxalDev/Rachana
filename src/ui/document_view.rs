@@ -1,5 +1,7 @@
 use gpui::*;
+use gpui::prelude::FluentBuilder;
 
+use crate::export;
 use crate::model::{Block, Document, FountainElement};
 use crate::parser::parse_block;
 use crate::ui::block_view::{
@@ -9,6 +11,7 @@ use crate::ui::block_view::{
 use crate::ui::text_runs::element_style;
 use crate::ui::file_dialog::{DialogMode, pick_file_subprocess};
 use crate::ui::modal::{InsertPoint, Key, ModalAction, ModalState};
+use crate::ui::properties::{PropertiesApplied, PropertiesPanel};
 
 // ---------------------------------------------------------------------------
 // EditHistory
@@ -61,6 +64,9 @@ pub struct DocumentView {
     scroll_handle: ScrollHandle,
     context_menu: Option<Point<Pixels>>,
     sidebar_open: bool,
+    export_menu_open: bool,
+    properties_open: bool,
+    properties: Entity<PropertiesPanel>,
     /// Anchor point (block_index, char_index) where a mouse-drag selection started.
     selection_anchor: Option<(usize, usize)>,
     /// Guard: true while a file open/save dialog is in-flight.
@@ -68,10 +74,17 @@ pub struct DocumentView {
     _subscriptions: Vec<Subscription>,
 }
 
+impl Focusable for DocumentView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl DocumentView {
     pub fn new(
         document: Entity<Document>,
         modal: Entity<ModalState>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let block_count = document.read(cx).blocks.len();
@@ -135,7 +148,29 @@ impl DocumentView {
             }));
         }
 
-        Self {
+        let properties = {
+            let (title, credit, author, source, draft_date, contact, notes) = {
+                let doc = document.read(cx);
+                (doc.title.clone(), doc.credit.clone(), doc.author.clone(),
+                 doc.source.clone(), doc.draft_date.clone(), doc.contact.clone(),
+                 doc.notes.clone())
+            };
+            cx.new(|cx| PropertiesPanel::new(
+                &title, &credit, &author, &source, &draft_date, &contact, &notes, cx,
+            ))
+        };
+        subs.push(cx.subscribe_in(&properties, window, |this, _, event: &PropertiesApplied, window, cx| {
+            this.apply_properties(event, cx);
+            this.focus_handle.clone().focus(window, cx);
+        }));
+
+        subs.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && !this.properties_open {
+                this.focus_handle.clone().focus(window, cx);
+            }
+        }));
+
+        let this = Self {
             document,
             modal,
             focused_block: 0,
@@ -147,10 +182,16 @@ impl DocumentView {
             scroll_handle: ScrollHandle::new(),
             context_menu: None,
             sidebar_open: false,
+            export_menu_open: false,
+            properties_open: false,
+            properties,
             selection_anchor: None,
             dialog_open: false,
             _subscriptions: subs,
-        }
+        };
+
+        window.focus(&this.focus_handle, cx);
+        this
     }
 
     // -----------------------------------------------------------------------
@@ -536,7 +577,7 @@ impl DocumentView {
                                     return;
                                 }
                                 Ok(Err(_)) | Err(_) => {
-                                    pick_file_subprocess(DialogMode::Save).await
+                                    pick_file_subprocess(DialogMode::Save, "fountain", "Fountain Files (*.fountain)").await
                                 }
                             };
                             weak_this.update(cx, |this, cx| {
@@ -585,7 +626,7 @@ impl DocumentView {
                     weak_this.update(cx, |this, _| this.dialog_open = false).ok();
                     return;
                 }
-                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Open).await,
+                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Open, "fountain", "Fountain Files (*.fountain)").await,
             };
             let loaded = path.as_deref().map(crate::io::load_fountain);
             weak_this.update(cx, |this, cx| {
@@ -634,7 +675,7 @@ impl DocumentView {
                     weak_this.update(cx, |this, _| this.dialog_open = false).ok();
                     return;
                 }
-                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Save).await,
+                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Save, "fountain", "Fountain Files (*.fountain)").await,
             };
             weak_this.update(cx, |this, cx| {
                 this.dialog_open = false;
@@ -655,6 +696,141 @@ impl DocumentView {
                 }
             }).ok();
         }).detach();
+    }
+
+    /// Base filename (no extension) for exports: the current file's stem if the
+    /// document has been saved, else "script".
+    fn export_basename(&self, cx: &Context<Self>) -> String {
+        self.document.read(cx).path.as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "script".to_string())
+    }
+
+    fn do_export(
+        &mut self, default_name: String, ext: &'static str, filter_label: &'static str,
+        bytes: Vec<u8>, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if self.dialog_open { return; }
+        self.dialog_open = true;
+
+        let receiver = cx.prompt_for_new_path(&std::path::Path::new(&default_name), None);
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(p))) => Some(p),
+                Ok(Ok(None)) => {
+                    weak_this.update(cx, |this, _| this.dialog_open = false).ok();
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => pick_file_subprocess(DialogMode::Save, ext, filter_label).await,
+            };
+            weak_this.update(cx, |this, _| {
+                this.dialog_open = false;
+                let Some(p) = path else { return; };
+                if let Err(e) = std::fs::write(&p, &bytes) {
+                    eprintln!("export error: {e}");
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn do_export_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::pdf::export_pdf(&self.document.read(cx));
+        let name = format!("{}.pdf", self.export_basename(cx));
+        self.do_export(name, "pdf", "PDF Files (*.pdf)", bytes, window, cx);
+    }
+
+    fn do_export_scene_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::reports::scene_list_csv(&self.document.read(cx)).into_bytes();
+        let name = format!("{}-scenes.csv", self.export_basename(cx));
+        self.do_export(name, "csv", "CSV Files (*.csv)", bytes, window, cx);
+    }
+
+    fn do_export_character_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::reports::character_list_csv(&self.document.read(cx)).into_bytes();
+        let name = format!("{}-characters.csv", self.export_basename(cx));
+        self.do_export(name, "csv", "CSV Files (*.csv)", bytes, window, cx);
+    }
+
+    fn do_export_location_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::reports::location_list_csv(&self.document.read(cx)).into_bytes();
+        let name = format!("{}-locations.csv", self.export_basename(cx));
+        self.do_export(name, "csv", "CSV Files (*.csv)", bytes, window, cx);
+    }
+
+    fn do_export_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::reports::notes_csv(&self.document.read(cx)).into_bytes();
+        let name = format!("{}-notes.csv", self.export_basename(cx));
+        self.do_export(name, "csv", "CSV Files (*.csv)", bytes, window, cx);
+    }
+
+    fn do_export_dialogue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = export::reports::dialogue_txt(&self.document.read(cx)).into_bytes();
+        let name = format!("{}-dialogue.txt", self.export_basename(cx));
+        self.do_export(name, "txt", "Text Files (*.txt)", bytes, window, cx);
+    }
+
+    fn do_open_properties(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (title, credit, author, source, draft_date, contact, notes) = {
+            let doc = self.document.read(cx);
+            (doc.title.clone(), doc.credit.clone(), doc.author.clone(),
+             doc.source.clone(), doc.draft_date.clone(), doc.contact.clone(),
+             doc.notes.clone())
+        };
+        self.properties.update(cx, |p, cx| {
+            *p = PropertiesPanel::new(&title, &credit, &author, &source, &draft_date, &contact, &notes, cx);
+        });
+        self.sidebar_open = false;
+        self.properties_open = true;
+        // Focus the first text field (not the panel's own handle).
+        let handle = self.properties.read(cx).first_focus_handle(cx);
+        handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn apply_properties(&mut self, event: &PropertiesApplied, cx: &mut Context<Self>) {
+        self.properties_open = false;
+
+        // Build the Fountain title page raw text from the new values.
+        let mut lines: Vec<String> = Vec::new();
+        if !event.title.is_empty()      { lines.push(format!("Title: {}", event.title)); }
+        if !event.credit.is_empty()     { lines.push(format!("Credit: {}", event.credit)); }
+        if !event.author.is_empty()     { lines.push(format!("Author: {}", event.author)); }
+        if !event.source.is_empty()     { lines.push(format!("Source: {}", event.source)); }
+        if !event.draft_date.is_empty() { lines.push(format!("Draft date: {}", event.draft_date)); }
+        if !event.contact.is_empty()    { lines.push(format!("Contact: {}", event.contact)); }
+        if !event.notes.is_empty() {
+            // Multiline notes use indented continuation lines.
+            if event.notes.contains('\n') {
+                lines.push("Notes:".to_string());
+                for note_line in event.notes.lines() {
+                    lines.push(format!("\t{}", note_line));
+                }
+            } else {
+                lines.push(format!("Notes: {}", event.notes));
+            }
+        }
+        let raw = lines.join("\n");
+
+        self.document.update(cx, |doc, _| {
+            doc.title      = event.title.clone();
+            doc.credit     = event.credit.clone();
+            doc.author     = event.author.clone();
+            doc.source     = event.source.clone();
+            doc.draft_date = event.draft_date.clone();
+            doc.contact    = event.contact.clone();
+            doc.notes      = event.notes.clone();
+
+            // Remove any existing title page block(s), then re-insert if we have content.
+            doc.blocks.retain(|b| b.element != FountainElement::TitlePage);
+            if !raw.is_empty() {
+                doc.blocks.insert(0, Block::new(FountainElement::TitlePage, raw.clone(), raw));
+            }
+            doc.dirty = true;
+        });
+
+        self.sync_block_views(cx);
+        cx.notify();
     }
 
     fn do_toggle_vim(&mut self, cx: &mut Context<Self>) {
@@ -698,6 +874,15 @@ impl DocumentView {
     // -----------------------------------------------------------------------
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The properties panel owns keyboard input while open (it's rendered as a
+        // child of this view's own focus subtree, so unhandled keystrokes from its
+        // text fields still bubble up here). Left un-stopped on purpose so the
+        // platform's text-input fallback can still deliver characters to the
+        // focused field - see the comment on PropertiesPanel::handle_panel_key.
+        if self.properties_open {
+            return;
+        }
+
         self.context_menu = None;
 
         let ks = &event.keystroke;
@@ -1353,6 +1538,10 @@ impl Render for DocumentView {
             root = root.child(self.render_sidebar(cx));
         }
 
+        if self.properties_open {
+            root = root.child(self.properties.clone());
+        }
+
         if let Some(pos) = context_menu {
             // Full-screen transparent overlay: any click outside menu dismisses it.
             root = root.child(
@@ -1382,6 +1571,7 @@ impl Render for DocumentView {
 impl DocumentView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_enabled = self.modal.read(cx).enabled;
+        let export_menu_open = self.export_menu_open;
         let item_style = |d: Div| {
             d.px(px(16.0))
                 .py(px(10.0))
@@ -1477,6 +1667,106 @@ impl DocumentView {
                     .child(sidebar_icon("icons/save.svg"))
                     .child(div().child("Save As\u{2026}")),
             )
+            .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
+            // Script Properties item
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.do_open_properties(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(sidebar_icon("icons/properties.svg"))
+                    .child(div().child("Script Properties")),
+            )
+            .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
+            // Export dropdown trigger
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.export_menu_open = !this.export_menu_open;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(sidebar_icon("icons/save.svg"))
+                    .child(div().flex_1().child("Export"))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(hsla(0.0, 0.0, 0.55, 1.0))
+                            .child(if export_menu_open { "\u{25be}" } else { "\u{25b8}" }),
+                    ),
+            )
+            .when(export_menu_open, |d| {
+                let sub_item_style = |d: Div| {
+                    d.pl(px(38.0))
+                        .pr(px(16.0))
+                        .py(px(8.0))
+                        .text_size(px(13.0))
+                        .text_color(hsla(0.0, 0.0, 0.85, 1.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x383838)))
+                };
+                d.child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_pdf(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export PDF\u{2026}"),
+                )
+                .child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_scene_list(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export Scene List\u{2026}"),
+                )
+                .child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_character_list(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export Character List\u{2026}"),
+                )
+                .child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_location_list(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export Location List\u{2026}"),
+                )
+                .child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_notes(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export Notes\u{2026}"),
+                )
+                .child(
+                    sub_item_style(div())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                            this.do_export_dialogue(window, cx);
+                            this.export_menu_open = false;
+                            cx.stop_propagation();
+                        }))
+                        .child("Export Dialogue\u{2026}"),
+                )
+            })
             .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
             .child(
                 item_style(div())

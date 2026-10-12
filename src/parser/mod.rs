@@ -20,10 +20,44 @@ fn normalize(source: &str) -> String {
     }
 }
 
+/// Parse a Fountain title page's raw text into a key→value map.
+/// Handles multiline values: continuation lines start with whitespace.
+fn parse_title_fields(raw: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut current_key: Option<String> = None;
+    let mut current_val = String::new();
+
+    for line in raw.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation line — append to the current value.
+            if current_key.is_some() {
+                if !current_val.is_empty() { current_val.push('\n'); }
+                current_val.push_str(line.trim());
+            }
+        } else if let Some(colon) = line.find(':') {
+            // New key: save the previous one first.
+            if let Some(key) = current_key.take() {
+                map.insert(key, current_val.trim().to_string());
+            }
+            current_key = Some(line[..colon].trim().to_lowercase());
+            current_val = line[colon + 1..].trim().to_string();
+        }
+    }
+    if let Some(key) = current_key {
+        map.insert(key, current_val.trim().to_string());
+    }
+    map
+}
+
 pub fn parse(source: &str) -> Document {
     let src = normalize(source);
     let mut title = String::new();
+    let mut credit = String::new();
     let mut author = String::new();
+    let mut source_field = String::new();
+    let mut draft_date = String::new();
+    let mut contact = String::new();
+    let mut notes = String::new();
 
     let pairs = match FountainParser::parse(Rule::document, &src) {
         Ok(p) => p,
@@ -35,7 +69,12 @@ pub fn parse(source: &str) -> Document {
                     source.to_string(),
                 )],
                 title,
+                credit,
                 author,
+                source: source_field,
+                draft_date,
+                contact,
+                notes,
                 dirty: false,
                 path: None,
             };
@@ -52,17 +91,14 @@ pub fn parse(source: &str) -> Document {
             match pair.as_rule() {
                 Rule::title_page => {
                     let raw = pair.as_str().to_string();
-                    for line in raw.lines() {
-                        if let Some(colon) = line.find(':') {
-                            let key = line[..colon].trim().to_lowercase();
-                            let val = line[colon + 1..].trim().to_string();
-                            match key.as_str() {
-                                "title" => title = val,
-                                "author" | "authors" => author = val,
-                                _ => {}
-                            }
-                        }
-                    }
+                    let fields = parse_title_fields(&raw);
+                    title       = fields.get("title").cloned().unwrap_or_default();
+                    credit      = fields.get("credit").cloned().unwrap_or_default();
+                    author      = fields.get("author").or_else(|| fields.get("authors")).cloned().unwrap_or_default();
+                    source_field = fields.get("source").cloned().unwrap_or_default();
+                    draft_date  = fields.get("draft date").or_else(|| fields.get("draft_date")).cloned().unwrap_or_default();
+                    contact     = fields.get("contact").cloned().unwrap_or_default();
+                    notes       = fields.get("notes").cloned().unwrap_or_default();
                     blocks.push(Block::new(FountainElement::TitlePage, raw.clone(), raw));
                 }
                 Rule::element => {
@@ -81,7 +117,7 @@ pub fn parse(source: &str) -> Document {
         blocks.push(Block::new(FountainElement::Action, String::new(), String::new()));
     }
 
-    Document { blocks, title, author, dirty: false, path: None }
+    Document { blocks, title, credit, author, source: source_field, draft_date, contact, notes, dirty: false, path: None }
 }
 
 fn push_blocks(blocks: &mut Vec<Block>, pair: pest::iterators::Pair<Rule>, raw: String) {
@@ -414,6 +450,18 @@ mod tests {
     }
 
     // --- full parse ---
+
+    #[test]
+    fn title_page_multiline_value() {
+        // Fountain title pages can have indented continuation lines (e.g. Notes:).
+        let src = "Title: Big Fish\nCredit: written by\nAuthor: John August\nNotes:\n\tFINAL PRODUCTION DRAFT\n\tincludes notes\nCopyright: (c) 2003\n\nINT. OFFICE - DAY\n\n";
+        let doc = parse(src);
+        assert_eq!(doc.title, "Big Fish");
+        assert_eq!(doc.credit, "written by");
+        assert_eq!(doc.author, "John August");
+        assert!(doc.blocks.iter().any(|b| b.element == FountainElement::TitlePage));
+        assert!(doc.blocks.iter().any(|b| b.element == FountainElement::SceneHeading));
+    }
 
     #[test]
     fn title_page() {

@@ -8,7 +8,9 @@ rest_of_line =  { line_char* }
 // Title page (key: value pairs before first blank line)
 title_key   = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | " ")* }
 title_value = { rest_of_line }
-title_item  = { title_key ~ ":" ~ " "* ~ title_value ~ NEWLINE }
+// Continuation lines start with at least one space or tab (indented).
+title_cont  = { (" " | "\t")+ ~ rest_of_line }
+title_item  = { title_key ~ ":" ~ " "* ~ title_value ~ NEWLINE ~ (title_cont ~ NEWLINE)* }
 // Allow a single blank line between title items: consume the extra NEWLINE only
 // when the lookahead confirms another key: pair follows immediately after it.
 title_page  = { (title_item | (NEWLINE ~ &(title_key ~ ":")))+ ~ BLANK_LINE }
