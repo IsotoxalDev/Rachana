@@ -10,14 +10,14 @@ mod settings;
 mod ui;
 
 use model::Document;
-use ui::document_view::DocumentView;
-use ui::modal::ModalState;
+use ui::app_root::AppRoot;
 use ui::text_field::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right,
     SelectAll, SelectLeft, SelectRight,
 };
 use ui::text_runs::{
     COURIER_PRIME_BOLD, COURIER_PRIME_BOLD_ITALIC, COURIER_PRIME_ITALIC, COURIER_PRIME_REGULAR,
+    LOBSTER_TWO_REGULAR,
 };
 
 struct EmbeddedAssets;
@@ -49,6 +49,7 @@ fn main() {
                     Cow::Borrowed(COURIER_PRIME_BOLD),
                     Cow::Borrowed(COURIER_PRIME_ITALIC),
                     Cow::Borrowed(COURIER_PRIME_BOLD_ITALIC),
+                    Cow::Borrowed(LOBSTER_TWO_REGULAR),
                 ])
                 .ok();
 
@@ -83,35 +84,27 @@ fn main() {
                 ..Default::default()
             };
 
-            let app_settings = settings::load();
-
             cx.open_window(options, |window, cx| {
-                let initial_doc = if std::env::var("TESTING").as_deref() == Ok("1") {
+                // With no file argument, the app opens on the Films library screen
+                // instead of a blank script.
+                let initial_doc: Option<Document> = if std::env::var("TESTING").as_deref() == Ok("1") {
                     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                         .join("example/Big-Fish.fountain");
-                    crate::io::load_fountain(&path).unwrap_or_else(|e| {
+                    Some(crate::io::load_fountain(&path).unwrap_or_else(|e| {
                         eprintln!("TESTING: failed to load Big-Fish.fountain: {e}");
                         Document::new()
-                    })
+                    }))
                 } else if let Some(path_arg) = std::env::args().nth(1) {
                     let path = std::path::PathBuf::from(path_arg);
-                    crate::io::load_fountain(&path).unwrap_or_else(|e| {
+                    Some(crate::io::load_fountain(&path).unwrap_or_else(|e| {
                         eprintln!("error opening file: {e}");
                         Document::new()
-                    })
+                    }))
                 } else {
-                    Document::new()
+                    None
                 };
 
-                let document = cx.new(|_| initial_doc);
-                let modal = cx.new(|_| {
-                    let mut m = ModalState::new();
-                    if app_settings.vim_enabled {
-                        m.toggle_vim();
-                    }
-                    m
-                });
-                cx.new(|cx| DocumentView::new(document, modal, window, cx))
+                cx.new(|cx| AppRoot::new(initial_doc, window, cx))
             })
             .unwrap();
         });

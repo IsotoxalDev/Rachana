@@ -10,6 +10,8 @@ pub const COURIER_PRIME_ITALIC: &[u8] =
     include_bytes!("../../assets/fonts/CourierPrime-Italic.ttf");
 pub const COURIER_PRIME_BOLD_ITALIC: &[u8] =
     include_bytes!("../../assets/fonts/CourierPrime-BoldItalic.ttf");
+pub const LOBSTER_TWO_REGULAR: &[u8] =
+    include_bytes!("../../assets/fonts/LobsterTwo-Regular.ttf");
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -48,6 +48,14 @@ impl EditHistory {
 }
 
 // ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+pub enum DocumentViewEvent {
+    BackToLibrary,
+}
+
+// ---------------------------------------------------------------------------
 // DocumentView
 // ---------------------------------------------------------------------------
 
@@ -79,6 +87,8 @@ impl Focusable for DocumentView {
         self.focus_handle.clone()
     }
 }
+
+impl EventEmitter<DocumentViewEvent> for DocumentView {}
 
 impl DocumentView {
     pub fn new(
@@ -529,6 +539,83 @@ impl DocumentView {
         cx.notify();
     }
 
+    fn do_back_to_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.document.read(cx).dirty {
+            cx.emit(DocumentViewEvent::BackToLibrary);
+            return;
+        }
+
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            "Unsaved Changes",
+            Some("Do you want to save the current script before returning to the library?"),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let Ok(choice) = receiver.await else { return; };
+            match choice {
+                0 => {
+                    let rx = weak_this.update(cx, |this, cx| -> Option<_> {
+                        if this.document.read(cx).path.is_some() {
+                            this.do_save(cx);
+                            Some(None)
+                        } else if this.dialog_open {
+                            None
+                        } else {
+                            this.dialog_open = true;
+                            let rx = cx.prompt_for_new_path(
+                                &std::path::Path::new("untitled.fountain"), None
+                            );
+                            Some(Some(rx))
+                        }
+                    });
+
+                    match rx {
+                        Ok(Some(None)) => {
+                            weak_this.update(cx, |_this, cx| cx.emit(DocumentViewEvent::BackToLibrary)).ok();
+                        }
+                        Ok(Some(Some(path_rx))) => {
+                            let path = match path_rx.await {
+                                Ok(Ok(Some(p))) => Some(p),
+                                Ok(Ok(None)) => {
+                                    weak_this.update(cx, |this, _| this.dialog_open = false).ok();
+                                    return;
+                                }
+                                Ok(Err(_)) | Err(_) => {
+                                    pick_file_subprocess(DialogMode::Save, "fountain", "Fountain Files (*.fountain)").await
+                                }
+                            };
+                            weak_this.update(cx, |this, cx| {
+                                this.dialog_open = false;
+                                if let Some(p) = path {
+                                    let ok = {
+                                        let doc = this.document.read(cx);
+                                        crate::io::save_fountain(&doc, &p).is_ok()
+                                    };
+                                    if ok {
+                                        this.document.update(cx, |d, _| {
+                                            d.path = Some(p);
+                                            d.dirty = false;
+                                        });
+                                        this.record_recent(cx);
+                                    }
+                                    cx.emit(DocumentViewEvent::BackToLibrary);
+                                }
+                            }).ok();
+                        }
+                        _ => {}
+                    }
+                }
+                1 => {
+                    weak_this.update(cx, |_this, cx| cx.emit(DocumentViewEvent::BackToLibrary)).ok();
+                }
+                _ => {}
+            }
+        }).detach();
+    }
+
     fn do_new_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.document.read(cx).dirty {
             self.reset_to_new(cx);
@@ -639,6 +726,7 @@ impl DocumentView {
                     this.sidebar_open = false;
                     this.sync_block_views(cx);
                     this.push_cursor(cx);
+                    this.record_recent(cx);
                     cx.notify();
                 }
             }).ok();
@@ -653,7 +741,10 @@ impl DocumentView {
                 crate::io::save_fountain(&doc, &p)
             };
             match result {
-                Ok(()) => { self.document.update(cx, |d, _| d.dirty = false); }
+                Ok(()) => {
+                    self.document.update(cx, |d, _| d.dirty = false);
+                    self.record_recent(cx);
+                }
                 Err(e) => eprintln!("save error: {e}"),
             }
         } else {
@@ -690,12 +781,22 @@ impl DocumentView {
                             d.path = Some(p);
                             d.dirty = false;
                         });
+                        this.record_recent(cx);
                         cx.notify();
                     }
                     Err(e) => eprintln!("save-as error: {e}"),
                 }
             }).ok();
         }).detach();
+    }
+
+    /// Record this script in the Films library's recent-scripts list, if it
+    /// has been saved to a path.
+    fn record_recent(&self, cx: &Context<Self>) {
+        let doc = self.document.read(cx);
+        if let Some(path) = &doc.path {
+            crate::settings::touch_recent(path, &doc.title, &doc.author, doc.scene_count());
+        }
     }
 
     /// Base filename (no extension) for exports: the current file's stem if the
@@ -836,7 +937,9 @@ impl DocumentView {
     fn do_toggle_vim(&mut self, cx: &mut Context<Self>) {
         self.modal.update(cx, |m, _| m.toggle_vim());
         let vim_enabled = self.modal.read(cx).enabled;
-        crate::settings::save(&crate::settings::Settings { vim_enabled });
+        let mut settings = crate::settings::load();
+        settings.vim_enabled = vim_enabled;
+        crate::settings::save(&settings);
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
@@ -1611,6 +1714,21 @@ impl DocumentView {
                             .child("Menu"),
                     ),
             )
+            // Films Library item — back to the box-office screen.
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.sidebar_open = false;
+                        this.do_back_to_library(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(div().w(px(16.0)).h(px(16.0)))
+                    .child(div().child("Films Library")),
+            )
+            .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
             // New Script item
             .child(
                 item_style(div())
