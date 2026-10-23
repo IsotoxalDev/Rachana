@@ -78,9 +78,11 @@ impl AppRoot {
     ) {
         match event {
             LibraryEvent::OpenScript(path) => self.open_script_path(path.clone(), window, cx),
-            LibraryEvent::NewScript => {
+            LibraryEvent::CreateScript { title, author } => {
                 let modal = cx.new(|_| new_modal());
-                let document = cx.new(|_| Document::new());
+                let mut doc = Document::new();
+                doc.apply_title_page_fields(title, "", author, "", "", "", "");
+                let document = cx.new(|_| doc);
                 self.open_document(document, modal, window, cx);
             }
             LibraryEvent::OpenFileRequested => self.open_file_dialog(window, cx),

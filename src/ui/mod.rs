@@ -1,9 +1,12 @@
 pub mod app_root;
 pub mod block_view;
+pub mod cover_art;
 pub mod document_view;
 pub mod file_dialog;
 pub mod library;
 pub mod modal;
+pub mod new_franchise_dialog;
+pub mod new_script_dialog;
 pub mod overlay;
 pub mod prompt;
 pub mod properties;

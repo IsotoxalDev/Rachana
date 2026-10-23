@@ -892,42 +892,11 @@ impl DocumentView {
     fn apply_properties(&mut self, event: &PropertiesApplied, cx: &mut Context<Self>) {
         self.properties_open = false;
 
-        // Build the Fountain title page raw text from the new values.
-        let mut lines: Vec<String> = Vec::new();
-        if !event.title.is_empty()      { lines.push(format!("Title: {}", event.title)); }
-        if !event.credit.is_empty()     { lines.push(format!("Credit: {}", event.credit)); }
-        if !event.author.is_empty()     { lines.push(format!("Author: {}", event.author)); }
-        if !event.source.is_empty()     { lines.push(format!("Source: {}", event.source)); }
-        if !event.draft_date.is_empty() { lines.push(format!("Draft date: {}", event.draft_date)); }
-        if !event.contact.is_empty()    { lines.push(format!("Contact: {}", event.contact)); }
-        if !event.notes.is_empty() {
-            // Multiline notes use indented continuation lines.
-            if event.notes.contains('\n') {
-                lines.push("Notes:".to_string());
-                for note_line in event.notes.lines() {
-                    lines.push(format!("\t{}", note_line));
-                }
-            } else {
-                lines.push(format!("Notes: {}", event.notes));
-            }
-        }
-        let raw = lines.join("\n");
-
         self.document.update(cx, |doc, _| {
-            doc.title      = event.title.clone();
-            doc.credit     = event.credit.clone();
-            doc.author     = event.author.clone();
-            doc.source     = event.source.clone();
-            doc.draft_date = event.draft_date.clone();
-            doc.contact    = event.contact.clone();
-            doc.notes      = event.notes.clone();
-
-            // Remove any existing title page block(s), then re-insert if we have content.
-            doc.blocks.retain(|b| b.element != FountainElement::TitlePage);
-            if !raw.is_empty() {
-                doc.blocks.insert(0, Block::new(FountainElement::TitlePage, raw.clone(), raw));
-            }
-            doc.dirty = true;
+            doc.apply_title_page_fields(
+                &event.title, &event.credit, &event.author, &event.source,
+                &event.draft_date, &event.contact, &event.notes,
+            );
         });
 
         self.sync_block_views(cx);
