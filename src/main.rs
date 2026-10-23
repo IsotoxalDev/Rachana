@@ -29,6 +29,8 @@ impl AssetSource for EmbeddedAssets {
             "icons/open.svg"       => include_bytes!("../assets/icons/open.svg"),
             "icons/properties.svg" => include_bytes!("../assets/icons/properties.svg"),
             "icons/save.svg"       => include_bytes!("../assets/icons/save.svg"),
+            "icons/close.svg"      => include_bytes!("../assets/icons/close.svg"),
+            "icons/films.svg"      => include_bytes!("../assets/icons/films.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))

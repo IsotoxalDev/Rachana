@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
@@ -1565,33 +1567,6 @@ impl Render for DocumentView {
                     ),
             );
 
-        // Hamburger button — always visible, top-left corner.
-        root = root.child(
-            div()
-                .absolute()
-                .top(px(12.0))
-                .left(px(14.0))
-                .w(px(32.0))
-                .h(px(32.0))
-                .flex()
-                .flex_col()
-                .justify_center()
-                .items_center()
-                .gap(px(5.0))
-                .cursor_pointer()
-                .rounded_md()
-                .hover(|s| s.bg(rgb(0x3a3a3a)))
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.sidebar_open = !this.sidebar_open;
-                    this.context_menu = None;
-                    cx.notify();
-                    cx.stop_propagation();
-                }))
-                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
-                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
-                .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa))),
-        );
-
         // Sidebar panel.
         if sidebar_open {
             // Dismiss overlay behind the sidebar.
@@ -1609,6 +1584,46 @@ impl Render for DocumentView {
             );
             root = root.child(self.render_sidebar(cx));
         }
+
+        // Hamburger button — top-left corner, rendered after the sidebar so
+        // it stays on top and clickable even while the sidebar is open
+        // (otherwise the sidebar's own click-catcher, which covers the same
+        // corner, would swallow the click instead of toggling the button).
+        root = root.child(
+            div()
+                .absolute()
+                .top(px(12.0))
+                .left(px(14.0))
+                .w(px(32.0))
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .rounded_md()
+                .when(sidebar_open, |d| d.bg(rgb(0x3a3a3a)))
+                .hover(|s| s.bg(rgb(0x3a3a3a)))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_open = !this.sidebar_open;
+                    this.context_menu = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }))
+                .when(sidebar_open, |d| d.child(sidebar_icon("icons/close.svg")))
+                .when(!sidebar_open, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
+                            .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa)))
+                            .child(div().w(px(18.0)).h(px(2.0)).bg(rgb(0xaaaaaa))),
+                    )
+                }),
+        );
 
         if self.properties_open {
             root = root.child(self.properties.clone());
@@ -1671,7 +1686,8 @@ impl DocumentView {
             .child(
                 div()
                     .h(px(52.0))
-                    .px(px(16.0))
+                    .pl(px(52.0))
+                    .pr(px(16.0))
                     .flex()
                     .items_center()
                     .border_b_1()
@@ -1694,7 +1710,7 @@ impl DocumentView {
                         this.do_back_to_library(window, cx);
                         cx.stop_propagation();
                     }))
-                    .child(div().w(px(16.0)).h(px(16.0)))
+                    .child(sidebar_icon("icons/films.svg"))
                     .child(div().child("Films Library")),
             )
             .child(div().h(px(1.0)).mx(px(12.0)).my(px(4.0)).bg(rgb(0x3a3a3a)))
@@ -1881,6 +1897,11 @@ impl DocumentView {
                             .child("\u{2713}"),
                     )
                     .child(div().child("Vim Mode")),
+            )
+            .with_animation(
+                "sidebar-slide-in",
+                Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                |this, delta| this.left(px(-220.0 + 220.0 * delta)),
             )
     }
 
