@@ -1561,9 +1561,34 @@ impl DocumentView {
         ]
     }
 
-    /// One continuous sheet holding every block — the original behavior.
-    fn render_pageless_content(&self, block_views: Vec<Entity<BlockView>>) -> Div {
+    /// One continuous sheet holding every block, with a small right-aligned
+    /// page number dropped in wherever a page would have broken — the
+    /// numbering of paged mode, without its gaps between sheets.
+    fn render_pageless_content(
+        &self, window: &Window, cx: &Context<Self>, block_views: Vec<Entity<BlockView>>,
+    ) -> Div {
+        let breaks = self.page_breaks(window, cx);
         let bvs_snap = block_views.clone();
+
+        // Interleave page-number markers with the real block views; `slots`
+        // tracks which flex child is which original block index (`None` for
+        // a marker) so `on_children_prepainted` can still find the right
+        // BlockView despite the extra children.
+        let mut items: Vec<AnyElement> = Vec::with_capacity(block_views.len() + 1);
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(block_views.len() + 1);
+        items.push(page_number_marker(1).into_any_element());
+        slots.push(None);
+        let mut page_number = 1;
+        for (i, bv) in block_views.into_iter().enumerate() {
+            if breaks.contains(&i) {
+                page_number += 1;
+                items.push(page_number_marker(page_number).into_any_element());
+                slots.push(None);
+            }
+            items.push(bv.into_any_element());
+            slots.push(Some(i));
+        }
+
         div()
             .w_full()
             .flex()
@@ -1582,14 +1607,16 @@ impl DocumentView {
                     .flex()
                     .flex_col()
                     .on_children_prepainted(move |bounds_list, _win, cx| {
-                        for (i, bounds) in bounds_list.iter().enumerate() {
-                            if let Some(bv) = bvs_snap.get(i) {
-                                let y = bounds.origin.y.as_f32();
-                                bv.update(cx, |v, _| v.top_y = y);
+                        for (slot, bounds) in bounds_list.iter().enumerate() {
+                            if let Some(Some(block_ix)) = slots.get(slot) {
+                                if let Some(bv) = bvs_snap.get(*block_ix) {
+                                    let y = bounds.origin.y.as_f32();
+                                    bv.update(cx, |v, _| v.top_y = y);
+                                }
                             }
                         }
                     })
-                    .children(block_views),
+                    .children(items),
             )
     }
 
@@ -1682,7 +1709,7 @@ impl Render for DocumentView {
                     .child(if self.paged_mode {
                         self.render_paged_content(window, cx, block_views)
                     } else {
-                        self.render_pageless_content(block_views)
+                        self.render_pageless_content(window, cx, block_views)
                     }),
             )
             .child(
@@ -2148,6 +2175,21 @@ impl DocumentView {
 
 fn char_to_byte(text: &str, char_idx: usize) -> usize {
     text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
+}
+
+fn page_number_marker(page_number: usize) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .justify_end()
+        .py(px(6.0))
+        .pr(px(32.0))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(hsla(0.0, 0.0, 0.5, 1.0))
+                .child(format!("{page_number}.")),
+        )
 }
 
 fn sidebar_icon(path: &'static str) -> Svg {
