@@ -407,7 +407,8 @@ impl Render for LibraryView {
                         this.assign_menu = None;
                         cx.notify();
                         cx.stop_propagation();
-                    })),
+                    }))
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
             let has_cover = self.scripts.get(ix).is_some_and(|s| s.cover.is_some());
             root = root.child(render_assign_menu(ix, pos, &self.franchises, has_cover, window, cx));
@@ -429,7 +430,8 @@ impl Render for LibraryView {
                         this.cover_menu = None;
                         cx.notify();
                         cx.stop_propagation();
-                    })),
+                    }))
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
             let has_cover = self.scripts.get(ix).is_some_and(|s| s.cover.is_some());
             root = root.child(render_cover_menu(ix, pos, has_cover, window, cx));

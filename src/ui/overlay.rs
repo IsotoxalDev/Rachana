@@ -1,8 +1,8 @@
 use gpui::*;
 
 /// Full-window backdrop + centered dialog wrapper shared by modal-style
-/// panels (prompts, properties, etc). Swallows backdrop clicks so they
-/// don't leak through to whatever is rendered underneath.
+/// panels (prompts, properties, etc). Swallows backdrop clicks and scroll
+/// so neither leaks through to whatever is scrollable underneath.
 pub fn modal_overlay<T: Render>(
     backdrop_opacity: f32,
     dialog: impl IntoElement,
@@ -15,6 +15,7 @@ pub fn modal_overlay<T: Render>(
         .left_0()
         .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
         .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         // Backdrop
         .child(
             div()

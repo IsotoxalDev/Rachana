@@ -1714,7 +1714,8 @@ impl Render for DocumentView {
                         this.sidebar_open = false;
                         cx.notify();
                         cx.stop_propagation();
-                    })),
+                    }))
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
             root = root.child(self.render_sidebar(cx));
         }
@@ -1780,7 +1781,8 @@ impl Render for DocumentView {
                         this.context_menu = None;
                         cx.notify();
                         cx.stop_propagation();
-                    })),
+                    }))
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
             root = root.child(self.render_context_menu(pos, cx));
         }
