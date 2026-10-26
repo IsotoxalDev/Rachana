@@ -27,6 +27,10 @@ pub struct RecentScript {
 pub struct Settings {
     #[serde(default)]
     pub vim_enabled: bool,
+    /// Show the script as discrete, numbered pages instead of one
+    /// continuous scroll.
+    #[serde(default)]
+    pub paged_mode: bool,
     #[serde(default)]
     pub recent_scripts: Vec<RecentScript>,
     /// Franchise/series names, in the display order chosen on the Films
@@ -37,7 +41,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { vim_enabled: false, recent_scripts: Vec::new(), franchise_order: Vec::new() }
+        Self { vim_enabled: false, paged_mode: false, recent_scripts: Vec::new(), franchise_order: Vec::new() }
     }
 }
 

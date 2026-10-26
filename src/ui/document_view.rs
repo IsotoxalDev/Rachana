@@ -76,6 +76,7 @@ pub struct DocumentView {
     sidebar_open: bool,
     export_menu_open: bool,
     properties_open: bool,
+    paged_mode: bool,
     properties: Entity<PropertiesPanel>,
     /// Anchor point (block_index, char_index) where a mouse-drag selection started.
     selection_anchor: Option<(usize, usize)>,
@@ -196,6 +197,7 @@ impl DocumentView {
             sidebar_open: false,
             export_menu_open: false,
             properties_open: false,
+            paged_mode: crate::settings::load().paged_mode,
             properties,
             selection_anchor: None,
             dialog_open: false,
@@ -913,6 +915,14 @@ impl DocumentView {
         crate::settings::save(&settings);
     }
 
+    fn do_toggle_paged_mode(&mut self, cx: &mut Context<Self>) {
+        self.paged_mode = !self.paged_mode;
+        let mut settings = crate::settings::load();
+        settings.paged_mode = self.paged_mode;
+        crate::settings::save(&settings);
+        cx.notify();
+    }
+
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
         let idx = self.focused_block;
         let count = self.char_count(idx, cx);
@@ -1470,6 +1480,172 @@ impl DocumentView {
         while i + 1 < chars.len() && !chars[i + 1].is_whitespace() { i += 1; }
         self.cursor_char = i;
     }
+
+    // -----------------------------------------------------------------------
+    // Paged / pageless layout
+    // -----------------------------------------------------------------------
+
+    /// Page sheet dimensions, in px at 96 px/inch (matches the 8.5x11 page
+    /// box rendered below) — kept here so pagination measures against
+    /// exactly the box it's slicing.
+    const PAGE_HEIGHT: f32 = 1056.0;
+    const PAGE_PAD_Y: f32 = 80.0;
+    /// Bottom margin BlockView puts under most blocks (see its `mb` gap
+    /// suppression rule, mirrored below so pagination measures real pixels).
+    const BLOCK_GAP: f32 = 8.0;
+
+    /// Block indices where a new page starts (page 1 always starts at block
+    /// 0, so those aren't included). Breaks land between blocks, never mid
+    /// block, and an explicit Fountain page-break element always starts a
+    /// fresh page. Measured in actual rendered pixels (line count × that
+    /// element's line height, plus inter-block spacing) rather than a flat
+    /// lines-per-page guess, so it matches what's really on each sheet.
+    fn page_breaks(&self, window: &Window, cx: &Context<Self>) -> Vec<usize> {
+        let doc = self.document.read(cx);
+        let page_content_height = Self::PAGE_HEIGHT - Self::PAGE_PAD_Y * 2.0;
+        let mut breaks = Vec::new();
+        let mut height_on_page = 0.0f32;
+        let mut force_break = false;
+
+        for (i, block) in doc.blocks.iter().enumerate() {
+            if force_break && i > 0 {
+                breaks.push(i);
+                height_on_page = 0.0;
+            }
+            force_break = block.element == FountainElement::PageBreak;
+
+            let next_element = doc.blocks.get(i + 1).map(|b| b.element.clone());
+            let suppress_gap = block.element == FountainElement::TitlePage
+                || matches!(
+                    (&block.element, &next_element),
+                    (
+                        FountainElement::Character | FountainElement::Dialogue | FountainElement::Parenthetical,
+                        Some(FountainElement::Character | FountainElement::Dialogue | FountainElement::Parenthetical)
+                    )
+                );
+            let gap = if suppress_gap { 0.0 } else { Self::BLOCK_GAP };
+
+            let style = element_style(&block.element);
+            let display = if style.uppercase { block.text.to_uppercase() } else { block.text.clone() };
+            let wrap_w = px(700.0 - style.left_pad.as_f32() - style.right_pad.as_f32());
+            let lines = count_visual_lines(&display, &style, wrap_w, window).max(1);
+            let block_height = lines as f32 * style.line_height.as_f32() + gap;
+
+            if i > 0 && height_on_page > 0.0 && height_on_page + block_height > page_content_height
+                && breaks.last() != Some(&i)
+            {
+                breaks.push(i);
+                height_on_page = 0.0;
+            }
+            height_on_page += block_height;
+        }
+        breaks
+    }
+
+    fn page_shadow() -> Vec<gpui::BoxShadow> {
+        vec![
+            gpui::BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.20),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(24.0),
+                spread_radius: px(0.0),
+                inset: false,
+            },
+            gpui::BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.10),
+                offset: gpui::point(px(0.0), px(1.0)),
+                blur_radius: px(4.0),
+                spread_radius: px(0.0),
+                inset: false,
+            },
+        ]
+    }
+
+    /// One continuous sheet holding every block — the original behavior.
+    fn render_pageless_content(&self, block_views: Vec<Entity<BlockView>>) -> Div {
+        let bvs_snap = block_views.clone();
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .pt(px(40.0))
+            .pb(px(40.0))
+            .child(
+                div()
+                    .w(px(700.0))
+                    .min_h(px(Self::PAGE_HEIGHT))
+                    .bg(rgb(0x252525))
+                    .rounded(px(5.0))
+                    .shadow(Self::page_shadow())
+                    .pt(px(Self::PAGE_PAD_Y))
+                    .pb(px(Self::PAGE_PAD_Y))
+                    .flex()
+                    .flex_col()
+                    .on_children_prepainted(move |bounds_list, _win, cx| {
+                        for (i, bounds) in bounds_list.iter().enumerate() {
+                            if let Some(bv) = bvs_snap.get(i) {
+                                let y = bounds.origin.y.as_f32();
+                                bv.update(cx, |v, _| v.top_y = y);
+                            }
+                        }
+                    })
+                    .children(block_views),
+            )
+    }
+
+    /// Discrete, numbered page sheets with a gap between them.
+    fn render_paged_content(
+        &self, window: &Window, cx: &Context<Self>, block_views: Vec<Entity<BlockView>>,
+    ) -> Div {
+        let breaks = self.page_breaks(window, cx);
+        let mut starts = vec![0usize];
+        starts.extend(breaks.iter().copied());
+        let mut ends = breaks;
+        ends.push(block_views.len());
+
+        let mut container = div().w_full().flex().flex_col().items_center().pt(px(40.0)).pb(px(40.0));
+
+        for (page_ix, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+            let chunk: Vec<_> = block_views[start..end].to_vec();
+            let bvs_snap = chunk.clone();
+            let page_number = page_ix + 1;
+
+            container = container.child(
+                div()
+                    .relative()
+                    .w(px(700.0))
+                    .min_h(px(Self::PAGE_HEIGHT))
+                    .mb(px(32.0))
+                    .bg(rgb(0x252525))
+                    .rounded(px(5.0))
+                    .shadow(Self::page_shadow())
+                    .pt(px(Self::PAGE_PAD_Y))
+                    .pb(px(Self::PAGE_PAD_Y))
+                    .flex()
+                    .flex_col()
+                    .on_children_prepainted(move |bounds_list, _win, cx| {
+                        for (i, bounds) in bounds_list.iter().enumerate() {
+                            if let Some(bv) = bvs_snap.get(i) {
+                                let y = bounds.origin.y.as_f32();
+                                bv.update(cx, |v, _| v.top_y = y);
+                            }
+                        }
+                    })
+                    .children(chunk)
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(24.0))
+                            .right(px(32.0))
+                            .text_size(px(11.0))
+                            .text_color(hsla(0.0, 0.0, 0.55, 1.0))
+                            .child(format!("{page_number}.")),
+                    ),
+            );
+        }
+
+        container
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,7 +1653,7 @@ impl DocumentView {
 // ---------------------------------------------------------------------------
 
 impl Render for DocumentView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = self.status_bar_text(cx).into();
         let block_views = self.block_views.clone();
         let context_menu = self.context_menu;
@@ -1503,53 +1679,11 @@ impl Render for DocumentView {
                     .w_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .pt(px(40.0))
-                            .pb(px(40.0))
-                            .child(
-                                {
-                                    let bvs_snap = block_views.clone();
-                                    div()
-                                        .w(px(700.0))
-                                        .min_h(px(1056.0))
-                                        .bg(rgb(0x252525))
-                                        .rounded(px(5.0))
-                                        .shadow(vec![
-                                            gpui::BoxShadow {
-                                                color: hsla(0.0, 0.0, 0.0, 0.20),
-                                                offset: gpui::point(px(0.0), px(6.0)),
-                                                blur_radius: px(24.0),
-                                                spread_radius: px(0.0),
-                                                inset: false,
-                                            },
-                                            gpui::BoxShadow {
-                                                color: hsla(0.0, 0.0, 0.0, 0.10),
-                                                offset: gpui::point(px(0.0), px(1.0)),
-                                                blur_radius: px(4.0),
-                                                spread_radius: px(0.0),
-                                                inset: false,
-                                            },
-                                        ])
-                                        .pt(px(80.0))
-                                        .pb(px(80.0))
-                                        .flex()
-                                        .flex_col()
-                                        .on_children_prepainted(move |bounds_list, _win, cx| {
-                                            for (i, bounds) in bounds_list.iter().enumerate() {
-                                                if let Some(bv) = bvs_snap.get(i) {
-                                                    let y = bounds.origin.y.as_f32();
-                                                    bv.update(cx, |v, _| v.top_y = y);
-                                                }
-                                            }
-                                        })
-                                        .children(block_views)
-                                },
-                            ),
-                    ),
+                    .child(if self.paged_mode {
+                        self.render_paged_content(window, cx, block_views)
+                    } else {
+                        self.render_pageless_content(block_views)
+                    }),
             )
             .child(
                 div()
@@ -1658,6 +1792,7 @@ impl Render for DocumentView {
 impl DocumentView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_enabled = self.modal.read(cx).enabled;
+        let paged_mode = self.paged_mode;
         let export_menu_open = self.export_menu_open;
         let item_style = |d: Div| {
             d.px(px(16.0))
@@ -1897,6 +2032,33 @@ impl DocumentView {
                             .child("\u{2713}"),
                     )
                     .child(div().child("Vim Mode")),
+            )
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.do_toggle_paged_mode(cx);
+                        this.sidebar_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(if paged_mode {
+                                hsla(0.0, 0.0, 0.85, 1.0)
+                            } else {
+                                hsla(0.0, 0.0, 0.0, 0.0)
+                            })
+                            .child("\u{2713}"),
+                    )
+                    .child(div().child("Paged Mode")),
             )
             .with_animation(
                 "sidebar-slide-in",

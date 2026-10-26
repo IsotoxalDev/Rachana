@@ -166,12 +166,32 @@ impl LibraryView {
         self.refresh(cx);
     }
 
-    fn delete_script(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(script) = self.scripts.get(ix) {
-            forget_script(&script.path);
-        }
+    fn delete_script(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.cover_menu = None;
-        self.refresh(cx);
+        let Some(script) = self.scripts.get(ix) else { return; };
+        let name = if script.title.trim().is_empty() {
+            script.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "this script".to_string())
+        } else {
+            script.title.clone()
+        };
+        let path = script.path.clone();
+
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove \u{201c}{name}\u{201d} from the library?"),
+            Some("The file on disk won't be touched \u{2014} you can bring it back with Open File\u{2026}."),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |weak_this, cx| {
+            let Ok(choice) = receiver.await else { return; };
+            if choice == 0 {
+                weak_this.update(cx, |this, cx| {
+                    forget_script(&path);
+                    this.refresh(cx);
+                }).ok();
+            }
+        }).detach();
     }
 
     fn choose_cover_image(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -742,8 +762,8 @@ fn render_cover_menu(
     .child(
         row_style(div())
             .text_color(hsla(0.0, 0.65, 0.6, 1.0))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                this.delete_script(ix, cx);
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                this.delete_script(ix, window, cx);
             }))
             .child("Remove from Library"),
     )
