@@ -1222,8 +1222,32 @@ impl DocumentView {
             ModalAction::PasteAbove => self.paste(false, cx),
             ModalAction::Undo => self.do_undo(cx),
             ModalAction::Redo => self.do_redo(cx),
+            ModalAction::DeleteForward => self.delete_char_at_cursor(cx),
             ModalAction::SearchStub | ModalAction::None => {}
             _ => {}
+        }
+    }
+
+    /// `x` in vim Normal mode — deletes the character under the cursor without
+    /// joining lines at end-of-block (unlike `delete_forward`, which backs Insert
+    /// mode's Delete key and merges with the next block there).
+    fn delete_char_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let idx = self.focused_block;
+        let count = self.char_count(idx, cx);
+        if count == 0 || self.cursor_char >= count { return; }
+        let text = self.text_of(idx, cx);
+        let Some((start, ch)) = text.char_indices().nth(self.cursor_char) else { return; };
+        let end = start + ch.len_utf8();
+        self.mutate(cx, |blocks| {
+            if let Some(b) = blocks.get_mut(idx) {
+                b.text.drain(start..end);
+                b.raw.drain(start..end);
+            }
+        });
+        self.re_parse_block(idx, cx);
+        let new_count = self.char_count(idx, cx);
+        if self.cursor_char >= new_count {
+            self.cursor_char = new_count.saturating_sub(1);
         }
     }
 

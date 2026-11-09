@@ -24,6 +24,40 @@ pub enum LibraryEvent {
     OpenFileRequested,
 }
 
+/// Drag payload carried while a poster card is being dragged onto a
+/// franchise box (or the ungrouped area) to move it.
+struct DraggedScript {
+    ix: usize,
+    title: String,
+}
+
+/// Small pill that follows the cursor while a poster card is being dragged.
+struct DraggedScriptPreview {
+    title: String,
+    click_offset: Point<Pixels>,
+}
+
+impl Render for DraggedScriptPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.click_offset.x + px(12.0))
+            .pt(self.click_offset.y + px(12.0))
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded_md()
+                    .bg(rgb(0x2a2a2a))
+                    .border_1()
+                    .border_color(rgb(0x4a90d9))
+                    .shadow_lg()
+                    .text_size(px(12.0))
+                    .text_color(hsla(0.0, 0.0, 0.92, 1.0))
+                    .child(self.title.clone()),
+            )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LibraryView — the "Films" box-office screen listing scripts worked on.
 // ---------------------------------------------------------------------------
@@ -377,6 +411,14 @@ impl Render for LibraryView {
                                             .flex_row()
                                             .flex_wrap()
                                             .gap(px(20.0))
+                                            .p(px(6.0))
+                                            .rounded_lg()
+                                            .drag_over::<DraggedScript>(|style, _, _, _| {
+                                                style.bg(rgb(0x241a1a)).border_1().border_color(rgb(0xd97a4a))
+                                            })
+                                            .on_drop(cx.listener(|this, dragged: &DraggedScript, _, cx| {
+                                                this.assign_group(dragged.ix, None, cx);
+                                            }))
                                             .children(
                                                 ungrouped.into_iter().map(|(ix, script)| poster_card(ix, script, cx)),
                                             ),
@@ -434,7 +476,8 @@ impl Render for LibraryView {
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
             let has_cover = self.scripts.get(ix).is_some_and(|s| s.cover.is_some());
-            root = root.child(render_cover_menu(ix, pos, has_cover, window, cx));
+            let current_group = self.scripts.get(ix).and_then(|s| s.group.clone());
+            root = root.child(render_cover_menu(ix, pos, has_cover, current_group, &franchises, window, cx));
         }
 
         root.children(self.dialog.clone()).children(self.franchise_dialog.clone())
@@ -584,7 +627,8 @@ fn group_section(
                         .child("\u{25be}"),
                 ),
         )
-        .child(
+        .child({
+            let drop_name = name.clone();
             div()
                 .p(px(14.0))
                 .bg(rgb(0x1a1a1a))
@@ -595,6 +639,12 @@ fn group_section(
                 .flex_row()
                 .flex_wrap()
                 .gap(px(20.0))
+                .drag_over::<DraggedScript>(|style, _, _, _| {
+                    style.bg(rgb(0x24344a)).border_color(rgb(0x4a90d9))
+                })
+                .on_drop(cx.listener(move |this, dragged: &DraggedScript, _, cx| {
+                    this.assign_group(dragged.ix, Some(drop_name.clone()), cx);
+                }))
                 .when(scripts.is_empty(), |d| {
                     d.child(
                         div()
@@ -603,8 +653,8 @@ fn group_section(
                             .child("No scripts in this franchise yet."),
                     )
                 })
-                .children(scripts.into_iter().map(|(ix, script)| poster_card(ix, script, cx))),
-        )
+                .children(scripts.into_iter().map(|(ix, script)| poster_card(ix, script, cx)))
+        })
 }
 
 /// Anchor a context-style menu at `pos`, flipping to grow up and/or left
@@ -707,7 +757,8 @@ fn render_assign_menu(
 }
 
 fn render_cover_menu(
-    ix: usize, pos: Point<Pixels>, has_cover: bool, window: &Window, cx: &mut Context<LibraryView>,
+    ix: usize, pos: Point<Pixels>, has_cover: bool, current_group: Option<String>,
+    franchises: &[String], window: &Window, cx: &mut Context<LibraryView>,
 ) -> impl IntoElement {
     let row_style = |d: Div| {
         d.px(px(14.0))
@@ -719,7 +770,8 @@ fn render_cover_menu(
     };
 
     let width = px(180.0);
-    let height_guess = px(if has_cover { 150.0 } else { 120.0 });
+    let height_guess =
+        px((if has_cover { 150.0 } else { 120.0 }) + 36.0 * (franchises.len() + 2) as f32);
     let menu = position_menu(div(), pos, width, height_guess, window);
     let mut menu = menu
         .absolute()
@@ -753,22 +805,59 @@ fn render_cover_menu(
         );
     }
 
-    menu.child(
+    menu = menu
+        .child(
+            row_style(div())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    this.reroll_cover_art(ix, cx);
+                }))
+                .child("New Random Cover"),
+        )
+        .child(div().h(px(1.0)).mx(px(8.0)).my(px(3.0)).bg(rgb(0x444444)));
+
+    if current_group.is_some() {
+        menu = menu.child(
+            row_style(div())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    this.cover_menu = None;
+                    this.assign_group(ix, None, cx);
+                }))
+                .child("Remove from Franchise"),
+        );
+    }
+    for name in franchises {
+        if current_group.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let for_click = name.clone();
+        menu = menu.child(
+            row_style(div())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    this.cover_menu = None;
+                    this.assign_group(ix, Some(for_click.clone()), cx);
+                }))
+                .child(format!("Move to {name}")),
+        );
+    }
+    menu = menu.child(
         row_style(div())
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                this.reroll_cover_art(ix, cx);
-            }))
-            .child("New Random Cover"),
-    )
-    .child(div().h(px(1.0)).mx(px(8.0)).my(px(3.0)).bg(rgb(0x444444)))
-    .child(
-        row_style(div())
-            .text_color(hsla(0.0, 0.65, 0.6, 1.0))
+            .text_color(hsla(0.0, 0.0, 0.6, 1.0))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                this.delete_script(ix, window, cx);
+                this.cover_menu = None;
+                this.open_new_franchise_dialog(Some(ix), window, cx);
             }))
-            .child("Remove from Library"),
-    )
+            .child("Move to New Franchise\u{2026}"),
+    );
+
+    menu.child(div().h(px(1.0)).mx(px(8.0)).my(px(3.0)).bg(rgb(0x444444)))
+        .child(
+            row_style(div())
+                .text_color(hsla(0.0, 0.65, 0.6, 1.0))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                    this.delete_script(ix, window, cx);
+                }))
+                .child("Remove from Library"),
+        )
 }
 
 fn poster_card(ix: usize, script: &RecentScript, cx: &mut Context<LibraryView>) -> impl IntoElement {
@@ -790,6 +879,13 @@ fn poster_card(ix: usize, script: &RecentScript, cx: &mut Context<LibraryView>) 
         .flex()
         .flex_col()
         .cursor_pointer()
+        .on_drag(
+            DraggedScript { ix, title: title.clone() },
+            |payload, click_offset, _, cx| {
+                let title = payload.title.clone();
+                cx.new(move |_| DraggedScriptPreview { title, click_offset })
+            },
+        )
         .on_click(cx.listener(move |_, _, _, cx| {
             cx.emit(LibraryEvent::OpenScript(path.clone()));
             cx.stop_propagation();

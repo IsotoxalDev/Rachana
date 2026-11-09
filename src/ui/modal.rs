@@ -279,6 +279,7 @@ impl ModalState {
             }
 
             // Edit
+            'x' => ModalAction::DeleteForward,
             'p' => ModalAction::PasteBelow,
             'P' => ModalAction::PasteAbove,
             'u' => ModalAction::Undo,
