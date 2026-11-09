@@ -1110,6 +1110,23 @@ impl DocumentView {
                 }
                 self.move_word_back(cx);
             }
+            ModalAction::ExtendSelectionLeft => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some((self.focused_block, self.cursor_char));
+                }
+                if self.cursor_char > 0 { self.cursor_char -= 1; }
+            }
+            ModalAction::ExtendSelectionRight => {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some((self.focused_block, self.cursor_char));
+                }
+                let max = self.char_count(self.focused_block, cx);
+                if self.cursor_char < max { self.cursor_char += 1; }
+            }
+            ModalAction::EnterInsert(pt) => {
+                self.selection_anchor = None;
+                self.enter_insert_at(pt, cx);
+            }
             ModalAction::EnterNormal | ModalAction::None => {
                 self.selection_anchor = None;
             }
@@ -2245,11 +2262,13 @@ fn keystroke_to_key(event: &KeyDownEvent) -> Key {
         "left" => {
             if mods.control && mods.shift { return Key::CtrlShiftArrowLeft; }
             if mods.control { return Key::CtrlArrowLeft; }
+            if mods.shift { return Key::ShiftArrowLeft; }
             return Key::ArrowLeft;
         }
         "right" => {
             if mods.control && mods.shift { return Key::CtrlShiftArrowRight; }
             if mods.control { return Key::CtrlArrowRight; }
+            if mods.shift { return Key::ShiftArrowRight; }
             return Key::ArrowRight;
         }
         "up" => return Key::ArrowUp,

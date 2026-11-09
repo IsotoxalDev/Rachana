@@ -287,7 +287,7 @@ impl Render for BlockView {
                     .top(cursor_pt.y)
                     .w(char_w)
                     .h(style.line_height)
-                    .bg(Hsla { h: 0.0, s: 0.0, l: 0.95, a: 1.0 })
+                    .bg(Hsla { h: 0.0, s: 0.0, l: 0.95, a: 0.45 })
             } else {
                 div()
                     .absolute()
@@ -368,6 +368,7 @@ pub(crate) fn visual_line_and_x(
     wrap_width: Pixels,
     window: &Window,
 ) -> (usize, f32) {
+    let content_width = wrap_width.as_f32();
     let mut visual_idx = 0usize;
     let mut char_offset = 0usize;
 
@@ -389,6 +390,13 @@ pub(crate) fn visual_line_and_x(
         );
         let wrap_starts = find_wrap_starts(nl, &shaped, wrap_width);
 
+        let total_width = shaped.width().as_f32();
+        let text_indent: f32 = match style.text_align {
+            StyleAlign::Left   => 0.0,
+            StyleAlign::Right  => (content_width - total_width).max(0.0),
+            StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
+        };
+
         let mut sub_starts: Vec<usize> = vec![0];
         sub_starts.extend(&wrap_starts);
         let n_segs = sub_starts.len();
@@ -408,7 +416,8 @@ pub(crate) fn visual_line_and_x(
                 let byte_in      = sub_s + nl[sub_s..].chars().take(chars_in).map(|c| c.len_utf8()).sum::<usize>();
                 let seg_start_x  = if sub_s == 0 { 0.0 } else { shaped.split_at(sub_s).0.width().as_f32() };
                 let cursor_abs_x = shaped.split_at(byte_in).0.width().as_f32();
-                return (visual_idx, cursor_abs_x - seg_start_x);
+                let effective_indent = if seg_idx == 0 { text_indent } else { 0.0 };
+                return (visual_idx, effective_indent + cursor_abs_x - seg_start_x);
             }
 
             visual_idx += 1;
@@ -459,6 +468,7 @@ pub(crate) fn char_at_visual_line_x(
     if text.is_empty() {
         return 0;
     }
+    let content_width = wrap_width.as_f32();
     let mut visual_idx = 0usize;
     let mut char_offset = 0usize;
 
@@ -480,6 +490,13 @@ pub(crate) fn char_at_visual_line_x(
         );
         let wrap_starts = find_wrap_starts(nl, &shaped, wrap_width);
 
+        let total_width = shaped.width().as_f32();
+        let text_indent: f32 = match style.text_align {
+            StyleAlign::Left   => 0.0,
+            StyleAlign::Right  => (content_width - total_width).max(0.0),
+            StyleAlign::Center => ((content_width - total_width) / 2.0).max(0.0),
+        };
+
         let mut sub_ranges: Vec<(usize, usize)> = Vec::new();
         let mut prev = 0usize;
         for &ws in &wrap_starts {
@@ -488,12 +505,13 @@ pub(crate) fn char_at_visual_line_x(
         }
         sub_ranges.push((prev, nl.len()));
 
-        for &(sub_s, sub_e) in &sub_ranges {
+        for (sub_idx, &(sub_s, sub_e)) in sub_ranges.iter().enumerate() {
             if visual_idx == visual_line {
                 let sub_abs_x = if sub_s == 0 { 0.0f32 } else {
                     shaped.split_at(sub_s).0.width().as_f32()
                 };
-                let abs_target = target_x + sub_abs_x;
+                let effective_indent = if sub_idx == 0 { text_indent } else { 0.0 };
+                let abs_target = (target_x - effective_indent).max(0.0) + sub_abs_x;
                 let chars: Vec<char> = nl.chars().collect();
                 let sub_char_start = nl[..sub_s].chars().count();
                 let sub_char_end   = nl[..sub_e].chars().count();

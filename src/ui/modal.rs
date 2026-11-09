@@ -25,6 +25,9 @@ pub enum Key {
     CtrlArrowRight,
     CtrlShiftArrowLeft,
     CtrlShiftArrowRight,
+    /// Shift+Right-arrow (no Ctrl): extend selection by one character.
+    ShiftArrowLeft,
+    ShiftArrowRight,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,8 +199,8 @@ impl ModalState {
     fn process_normal_key(&mut self, key: Key) -> ModalAction {
         // Arrow keys work in normal mode too (alongside hjkl).
         match &key {
-            Key::ArrowLeft => return ModalAction::MoveCursor { motion: CursorMove::Left, count: self.pending_count.take().unwrap_or(1) },
-            Key::ArrowRight => return ModalAction::MoveCursor { motion: CursorMove::Right, count: self.pending_count.take().unwrap_or(1) },
+            Key::ArrowLeft | Key::ShiftArrowLeft => return ModalAction::MoveCursor { motion: CursorMove::Left, count: self.pending_count.take().unwrap_or(1) },
+            Key::ArrowRight | Key::ShiftArrowRight => return ModalAction::MoveCursor { motion: CursorMove::Right, count: self.pending_count.take().unwrap_or(1) },
             Key::ArrowUp => return ModalAction::MoveCursor { motion: CursorMove::Up, count: self.pending_count.take().unwrap_or(1) },
             Key::ArrowDown => return ModalAction::MoveCursor { motion: CursorMove::Down, count: self.pending_count.take().unwrap_or(1) },
             _ => {}
@@ -318,6 +321,8 @@ impl ModalState {
             Key::CtrlArrowRight => ModalAction::MoveCursor { motion: CursorMove::WordForward, count: 1 },
             Key::CtrlShiftArrowLeft  => ModalAction::SelectWordBackward,
             Key::CtrlShiftArrowRight => ModalAction::SelectWordForward,
+            Key::ShiftArrowLeft  => ModalAction::ExtendSelectionLeft,
+            Key::ShiftArrowRight => ModalAction::ExtendSelectionRight,
             Key::Char(c) if !c.is_control() => ModalAction::InsertChar(c),
             _ => ModalAction::None,
         }
@@ -325,8 +330,8 @@ impl ModalState {
 
     fn process_visual_key(&mut self, key: Key) -> ModalAction {
         match key {
-            Key::Char('h') | Key::ArrowLeft  => ModalAction::ExtendSelectionLeft,
-            Key::Char('l') | Key::ArrowRight => ModalAction::ExtendSelectionRight,
+            Key::Char('h') | Key::ArrowLeft  | Key::ShiftArrowLeft  => ModalAction::ExtendSelectionLeft,
+            Key::Char('l') | Key::ArrowRight | Key::ShiftArrowRight => ModalAction::ExtendSelectionRight,
             Key::Char('y') => {
                 self.enter_normal();
                 ModalAction::YankSelection
