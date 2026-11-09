@@ -1512,7 +1512,9 @@ impl DocumentView {
                 breaks.push(i);
                 height_on_page = 0.0;
             }
-            force_break = block.element == FountainElement::PageBreak;
+            // A title page always stands alone on its own (unnumbered) sheet,
+            // same as an explicit Fountain page-break.
+            force_break = matches!(block.element, FountainElement::PageBreak | FountainElement::TitlePage);
 
             let next_element = doc.blocks.get(i + 1).map(|b| b.element.clone());
             let suppress_gap = block.element == FountainElement::TitlePage
@@ -1567,18 +1569,29 @@ impl DocumentView {
     fn render_pageless_content(
         &self, window: &Window, cx: &Context<Self>, block_views: Vec<Entity<BlockView>>,
     ) -> Div {
+        let has_title_page = self.document.read(cx).blocks.first()
+            .map(|b| b.element == FountainElement::TitlePage)
+            .unwrap_or(false);
         let breaks = self.page_breaks(window, cx);
         let bvs_snap = block_views.clone();
 
         // Interleave page-number markers with the real block views; `slots`
         // tracks which flex child is which original block index (`None` for
         // a marker) so `on_children_prepainted` can still find the right
-        // BlockView despite the extra children.
+        // BlockView despite the extra children. Numbering starts right after
+        // the title page: no "1." marker before it — the forced break the
+        // title page always gets (see `page_breaks`) lands the first number
+        // on the first real content block instead.
         let mut items: Vec<AnyElement> = Vec::with_capacity(block_views.len() + 1);
         let mut slots: Vec<Option<usize>> = Vec::with_capacity(block_views.len() + 1);
-        items.push(page_number_marker(1).into_any_element());
-        slots.push(None);
-        let mut page_number = 1;
+        let mut page_number;
+        if has_title_page {
+            page_number = 0;
+        } else {
+            items.push(page_number_marker(1).into_any_element());
+            slots.push(None);
+            page_number = 1;
+        }
         for (i, bv) in block_views.into_iter().enumerate() {
             if breaks.contains(&i) {
                 page_number += 1;
@@ -1624,6 +1637,9 @@ impl DocumentView {
     fn render_paged_content(
         &self, window: &Window, cx: &Context<Self>, block_views: Vec<Entity<BlockView>>,
     ) -> Div {
+        let has_title_page = self.document.read(cx).blocks.first()
+            .map(|b| b.element == FountainElement::TitlePage)
+            .unwrap_or(false);
         let breaks = self.page_breaks(window, cx);
         let mut starts = vec![0usize];
         starts.extend(breaks.iter().copied());
@@ -1635,7 +1651,10 @@ impl DocumentView {
         for (page_ix, (start, end)) in starts.into_iter().zip(ends).enumerate() {
             let chunk: Vec<_> = block_views[start..end].to_vec();
             let bvs_snap = chunk.clone();
-            let page_number = page_ix + 1;
+            // Numbering starts right after the title page: its own sheet
+            // (page_ix 0) gets no number, and the next sheet is "1.".
+            let show_number = !(has_title_page && page_ix == 0);
+            let page_number = if has_title_page { page_ix } else { page_ix + 1 };
 
             container = container.child(
                 div()
@@ -1659,7 +1678,7 @@ impl DocumentView {
                         }
                     })
                     .children(chunk)
-                    .child(
+                    .when(show_number, |d| d.child(
                         div()
                             .absolute()
                             .top(px(24.0))
@@ -1667,7 +1686,7 @@ impl DocumentView {
                             .text_size(px(11.0))
                             .text_color(hsla(0.0, 0.0, 0.55, 1.0))
                             .child(format!("{page_number}.")),
-                    ),
+                    )),
             );
         }
 
