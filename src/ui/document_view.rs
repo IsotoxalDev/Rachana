@@ -77,6 +77,21 @@ pub struct DocumentView {
     export_menu_open: bool,
     properties_open: bool,
     paged_mode: bool,
+    /// When true, the view scrolls after every cursor move to keep the
+    /// cursor's line centered vertically (typewriter scrolling).
+    typewriter_mode: bool,
+    /// (focused_block, cursor_char) as of the last time typewriter mode
+    /// centered the view — lets `center_cursor_line` tell "cursor moved" apart
+    /// from "render happened for some other reason (e.g. a manual scroll)",
+    /// so a manual scroll isn't immediately snapped back.
+    typewriter_last_pos: Option<(usize, usize)>,
+    /// Frames left to keep re-attempting the centering after a cursor move.
+    /// A freshly-created block (e.g. from pressing Enter) starts out with a
+    /// stale `top_y` until its first paint, so one attempt isn't enough —
+    /// this lets a couple of follow-up renders retry with the real position
+    /// once it's available, while still giving up (and yielding back to
+    /// manual scroll) after a bounded number of tries.
+    typewriter_retries_left: u8,
     properties: Entity<PropertiesPanel>,
     /// Anchor point (block_index, char_index) where a mouse-drag selection started.
     selection_anchor: Option<(usize, usize)>,
@@ -198,6 +213,9 @@ impl DocumentView {
             export_menu_open: false,
             properties_open: false,
             paged_mode: crate::settings::load().paged_mode,
+            typewriter_mode: false,
+            typewriter_last_pos: None,
+            typewriter_retries_left: 0,
             properties,
             selection_anchor: None,
             dialog_open: false,
@@ -281,6 +299,84 @@ impl DocumentView {
                 v.selection = sel;
                 cx.notify();
             });
+        }
+    }
+
+    /// Typewriter mode: scroll so the cursor's visual line sits at the vertical
+    /// center of the viewport. Uses each block's `top_y` as of the last paint
+    /// (updated via `on_children_prepainted`).
+    fn center_cursor_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.typewriter_mode { return; }
+        let pos = (self.focused_block, self.cursor_char);
+        if self.typewriter_last_pos != Some(pos) {
+            // Cursor moved: (re)start a short retry window. A block created
+            // this same keystroke (e.g. Enter splitting a new block below)
+            // hasn't been through its first paint yet, so its `top_y` is
+            // still a stale default and this attempt can land on garbage.
+            // Retrying across a couple of frames lets it settle once the
+            // real position is available, without retrying forever and
+            // permanently overriding a later manual scroll.
+            self.typewriter_last_pos = Some(pos);
+            self.typewriter_retries_left = 6;
+        }
+        if self.typewriter_retries_left == 0 { return; }
+        self.typewriter_retries_left -= 1;
+
+        if !self.try_center_cursor_line(window, cx) && self.typewriter_retries_left > 0 {
+            // Force another frame even though nothing else changed, so the
+            // retry (re-entering this method from the top of the next
+            // render()) can pick up that frame's freshly-painted layout
+            // data. A manual `on_next_frame` + `cx.notify()` isn't reliable
+            // here — properly deferring the notify to the right point in the
+            // frame lifecycle is exactly what this call exists for.
+            window.request_animation_frame();
+        }
+    }
+
+    /// One centering attempt. Returns true once it's converged (or has given
+    /// up because the scroll range is exhausted) — false if it should retry.
+    fn try_center_cursor_line(&self, window: &Window, cx: &Context<Self>) -> bool {
+        let Some(bv) = self.block_views.get(self.focused_block) else { return false; };
+        let top_y = bv.read(cx).top_y;
+        let Some(element) = self.document.read(cx).blocks.get(self.focused_block).map(|b| b.element.clone()) else { return true; };
+        let text = self.text_of(self.focused_block, cx);
+
+        let style = element_style(&element);
+        let display = if style.uppercase { text.to_uppercase() } else { text };
+        let wrap_w = px(700.0 - style.left_pad.as_f32() - style.right_pad.as_f32());
+        let (vline, _) = visual_line_and_x(&display, self.cursor_char, &style, wrap_w, window);
+        let line_h = style.line_height.as_f32();
+        let cursor_y = top_y + vline as f32 * line_h + line_h / 2.0;
+
+        let bounds = self.scroll_handle.bounds();
+        if bounds.size.height <= px(0.0) { return false; }
+        let viewport_center = bounds.origin.y.as_f32() + bounds.size.height.as_f32() / 2.0;
+        let delta = viewport_center - cursor_y;
+        if delta.abs() < 0.5 { return true; }
+
+        let current = self.scroll_handle.offset();
+        // `max_offset()` is also a stale, last-paint snapshot — right after
+        // toggling the mode on (or right after the content's height changes
+        // for any other reason), it can still reflect the old, smaller
+        // content and clamp us to 0 even though the real, now-larger content
+        // has room to scroll. Apply it anyway rather than treating a clamp
+        // as "done": once the next paint settles, a later retry will see the
+        // real max and can keep moving instead of being stuck at the stale
+        // boundary.
+        let max_y = self.scroll_handle.max_offset().y.as_f32();
+        let new_y = (current.y.as_f32() + delta).clamp(-max_y, 0.0);
+        self.scroll_handle.set_offset(point(current.x, px(new_y)));
+        false
+    }
+
+    /// Vertical padding around the scrollable content. In typewriter mode this
+    /// is widened to half the viewport height so the first/last line can still
+    /// be scrolled to dead center; otherwise it's the normal fixed margin.
+    fn typewriter_pad_y(&self, window: &Window) -> f32 {
+        if self.typewriter_mode {
+            (window.viewport_size().height.as_f32() / 2.0).max(40.0)
+        } else {
+            40.0
         }
     }
 
@@ -920,6 +1016,14 @@ impl DocumentView {
         let mut settings = crate::settings::load();
         settings.paged_mode = self.paged_mode;
         crate::settings::save(&settings);
+        cx.notify();
+    }
+
+    fn do_toggle_typewriter(&mut self, cx: &mut Context<Self>) {
+        self.typewriter_mode = !self.typewriter_mode;
+        // Force an immediate recenter on enable, even if the cursor hasn't
+        // moved since it was last off.
+        self.typewriter_last_pos = None;
         cx.notify();
     }
 
@@ -1643,12 +1747,13 @@ impl DocumentView {
             slots.push(Some(i));
         }
 
+        let pad_y = self.typewriter_pad_y(window);
         div()
             .w_full()
             .flex()
             .justify_center()
-            .pt(px(40.0))
-            .pb(px(40.0))
+            .pt(px(pad_y))
+            .pb(px(pad_y))
             .child(
                 div()
                     .w(px(700.0))
@@ -1687,7 +1792,8 @@ impl DocumentView {
         let mut ends = breaks;
         ends.push(block_views.len());
 
-        let mut container = div().w_full().flex().flex_col().items_center().pt(px(40.0)).pb(px(40.0));
+        let pad_y = self.typewriter_pad_y(window);
+        let mut container = div().w_full().flex().flex_col().items_center().pt(px(pad_y)).pb(px(pad_y));
 
         for (page_ix, (start, end)) in starts.into_iter().zip(ends).enumerate() {
             let chunk: Vec<_> = block_views[start..end].to_vec();
@@ -1741,6 +1847,7 @@ impl DocumentView {
 
 impl Render for DocumentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.center_cursor_line(window, cx);
         let status: SharedString = self.status_bar_text(cx).into();
         let block_views = self.block_views.clone();
         let context_menu = self.context_menu;
@@ -1882,6 +1989,7 @@ impl DocumentView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_enabled = self.modal.read(cx).enabled;
         let paged_mode = self.paged_mode;
+        let typewriter_mode = self.typewriter_mode;
         let export_menu_open = self.export_menu_open;
         let item_style = |d: Div| {
             d.px(px(16.0))
@@ -2148,6 +2256,33 @@ impl DocumentView {
                             .child("\u{2713}"),
                     )
                     .child(div().child("Paged Mode")),
+            )
+            .child(
+                item_style(div())
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.do_toggle_typewriter(cx);
+                        this.sidebar_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(if typewriter_mode {
+                                hsla(0.0, 0.0, 0.85, 1.0)
+                            } else {
+                                hsla(0.0, 0.0, 0.0, 0.0)
+                            })
+                            .child("\u{2713}"),
+                    )
+                    .child(div().child("Typewriter Mode")),
             )
             .with_animation(
                 "sidebar-slide-in",
